@@ -1,0 +1,610 @@
+import unittest
+from unittest.mock import MagicMock, patch
+import tempfile
+import json
+from pathlib import Path
+
+from src.config import load_config, AppConfig, ImmichConfig, ICloudConfig, AmazonConfig, SyncSettings
+from src.database import SyncDatabase
+from src.engine import SyncEngine
+from src.utils import compute_hashes, get_mime_type, format_bytes
+
+class TestSyncComponents(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "test_state.db"
+        self.db = SyncDatabase(self.db_path)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_database_asset_lifecycle(self):
+        # 1. Upsert new asset
+        self.db.upsert_asset(
+            sha1="abc123sha1",
+            md5="abc123md5",
+            filename="vacation.jpg",
+            file_size=102400,
+            immich_id="immich-uuid-1",
+            icloud_id="icloud-asset-1",
+            amazon_id="amz-node-1"
+        )
+
+        asset = self.db.get_asset_by_sha1("abc123sha1")
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset["filename"], "vacation.jpg")
+        self.assertEqual(asset["immich_id"], "immich-uuid-1")
+        self.assertEqual(asset["status"], "ACTIVE")
+
+        # 2. Check active assets
+        active = self.db.get_active_assets()
+        self.assertEqual(len(active), 1)
+
+        # 3. Mark asset deleted from Immich
+        self.db.mark_asset_deleted("immich-uuid-1", reason="DELETED_IN_IMMICH")
+        active_after = self.db.get_active_assets()
+        self.assertEqual(len(active_after), 0)
+
+        updated_asset = self.db.get_asset_by_immich_id("immich-uuid-1")
+        self.assertEqual(updated_asset["status"], "DELETED_IN_IMMICH")
+
+    def test_database_albums(self):
+        # 1. Track album
+        self.db.upsert_album(
+            immich_id="immich-alb-1",
+            name="Summer Trip",
+            amazon_id="amz-alb-1"
+        )
+
+        album = self.db.get_album("immich-alb-1")
+        self.assertIsNotNone(album)
+        self.assertEqual(album["name"], "Summer Trip")
+        self.assertEqual(album["amazon_id"], "amz-alb-1")
+
+        # 2. Update album with icloud ID
+        self.db.upsert_album(
+            immich_id="immich-alb-1",
+            name="Summer Trip Updated",
+            icloud_id="icloud-alb-1"
+        )
+        album_updated = self.db.get_album("immich-alb-1")
+        self.assertEqual(album_updated["name"], "Summer Trip Updated")
+        self.assertEqual(album_updated["amazon_id"], "amz-alb-1")
+        self.assertEqual(album_updated["icloud_id"], "icloud-alb-1")
+
+    def test_utils_hashing(self):
+        sample_file = Path(self.temp_dir.name) / "sample.txt"
+        sample_file.write_bytes(b"hello photo sync world")
+        sha1, md5 = compute_hashes(sample_file)
+        self.assertTrue(len(sha1) == 40)
+        self.assertTrue(len(md5) == 32)
+
+    def test_mime_detection(self):
+        self.assertEqual(get_mime_type("photo.heic"), "image/heic")
+        self.assertEqual(get_mime_type("photo.jpg"), "image/jpeg")
+        self.assertEqual(get_mime_type("video.mov"), "video/quicktime")
+
+    def test_config_parsing(self):
+        sample_cfg = {
+            "immich": {
+                "url": "http://localhost:2283",
+                "api_key": "test_key",
+                "verify_ssl": True
+            },
+            "icloud": {
+                "apple_id": "test@icloud.com",
+                "session_dir": "./.icloud_session"
+            },
+            "amazon": {
+                "cookies": {"session-id": "test-session"},
+                "tld": "com"
+            },
+            "sync": {
+                "sync_deletions": True,
+                "sync_albums": True,
+                "max_delete_limit": 25
+            }
+        }
+        cfg_file = Path(self.temp_dir.name) / "config.json"
+        cfg_file.write_text(json.dumps(sample_cfg), encoding="utf-8")
+
+        loaded = load_config(cfg_file)
+        self.assertEqual(loaded.immich.url, "http://localhost:2283")
+        self.assertEqual(loaded.sync.max_delete_limit, 25)
+        self.assertTrue(loaded.sync.sync_deletions)
+
+    def test_engine_deletion_sync(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com"),
+            amazon=AmazonConfig(cookies={"session-id": "test"}),
+            sync=SyncSettings(max_delete_limit=10, sync_deletions=True, dry_run=False)
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        # Insert active asset in DB
+        engine.db.upsert_asset(
+            sha1="hash111",
+            filename="delete_me.jpg",
+            immich_id="immich-123",
+            icloud_id="icloud-123",
+            amazon_id="amz-123",
+            status="ACTIVE"
+        )
+
+        # Mock Immich returning empty list of active assets (asset was deleted in Immich)
+        engine.immich.get_all_assets = MagicMock(return_value=[])
+
+        # Mock Amazon trash and iCloud delete
+        engine.amazon.trash_nodes = MagicMock(return_value=True)
+        fake_photo = MagicMock()
+        engine.icloud.find_photo_by_id = MagicMock(return_value=fake_photo)
+        engine.icloud.delete_photo = MagicMock(return_value=True)
+
+        deleted_count = engine._sync_deletions(force=False)
+        self.assertEqual(deleted_count, 1)
+
+        # Verify Amazon trash called
+        engine.amazon.trash_nodes.assert_called_once_with(["amz-123"])
+
+        # Verify iCloud delete called
+        engine.icloud.delete_photo.assert_called_once_with(fake_photo)
+
+        # Verify DB status updated
+        asset = engine.db.get_asset_by_immich_id("immich-123")
+        self.assertEqual(asset["status"], "DELETED_IN_IMMICH")
+
+    def test_engine_deletion_safety_guard(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com"),
+            amazon=AmazonConfig(cookies={"session-id": "test"}),
+            sync=SyncSettings(max_delete_limit=2, sync_deletions=True, dry_run=False)
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        # Insert 3 active assets
+        for i in range(3):
+            engine.db.upsert_asset(
+                sha1=f"hash_{i}",
+                filename=f"file_{i}.jpg",
+                immich_id=f"immich_{i}",
+                status="ACTIVE"
+            )
+
+        # Immich returns empty (3 deletions exceed max_delete_limit of 2)
+        engine.immich.get_all_assets = MagicMock(return_value=[])
+        engine.amazon.trash_nodes = MagicMock()
+
+        deleted_count = engine._sync_deletions(force=False)
+        # Should be blocked by safety guard
+        self.assertEqual(deleted_count, 0)
+        engine.amazon.trash_nodes.assert_not_called()
+
+        # With force=True, it should proceed
+        engine.amazon.trash_nodes = MagicMock(return_value=True)
+        deleted_count_forced = engine._sync_deletions(force=True)
+        self.assertEqual(deleted_count_forced, 3)
+
+    def test_engine_album_sync(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com"),
+            amazon=AmazonConfig(cookies={"session-id": "test"}),
+            sync=SyncSettings(sync_albums=True, dry_run=False)
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        # Track an asset in DB
+        engine.db.upsert_asset(
+            sha1="photo_hash_1",
+            filename="nature.jpg",
+            immich_id="immich-photo-1",
+            amazon_id="amz-node-99"
+        )
+
+        # Mock Immich album
+        engine.immich.get_albums = MagicMock(return_value=[
+            {"id": "immich-alb-55", "albumName": "Nature 2026"}
+        ])
+        engine.immich.get_album_details = MagicMock(return_value={
+            "id": "immich-alb-55",
+            "assets": [{"id": "immich-photo-1"}]
+        })
+
+        engine.amazon.create_album = MagicMock(return_value="amz-alb-77")
+        engine.icloud.create_album = MagicMock(return_value=MagicMock())
+
+        synced_albums = engine._sync_albums()
+        self.assertEqual(synced_albums, 1)
+
+        # Verify Amazon album created with node
+        engine.amazon.create_album.assert_called_once_with("Nature 2026", ["amz-node-99"])
+
+        # Verify DB tracked album mapping
+        alb = engine.db.get_album("immich-alb-55")
+        self.assertIsNotNone(alb)
+        self.assertEqual(alb["name"], "Nature 2026")
+        self.assertEqual(alb["amazon_id"], "amz-alb-77")
+
+    def test_engine_immich_direct_sync_to_amazon_and_icloud(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com"),
+            amazon=AmazonConfig(cookies={"session-id": "test"}),
+            sync=SyncSettings(download_temp_dir=str(self.temp_dir.name), dry_run=False)
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        # Asset uploaded directly to Immich
+        engine.immich.get_all_assets = MagicMock(return_value=[
+            {"id": "immich-direct-101", "originalFileName": "camera_card.jpg"}
+        ])
+
+        # Mock download from Immich
+        def mock_download(asset_id, dest_path):
+            Path(dest_path).write_bytes(b"camera raw bytes 12345")
+            return dest_path
+
+        engine.immich.download_asset = MagicMock(side_effect=mock_download)
+        engine.amazon.find_by_md5 = MagicMock(return_value=None)
+        engine.amazon.upload_photo = MagicMock(return_value="amz-direct-node-555")
+        engine.icloud.upload_photo = MagicMock(return_value="icloud-direct-asset-777")
+
+        stats = {"immich_direct_synced": 0, "amazon_uploaded": 0, "icloud_uploaded": 0, "errors": 0}
+        count = engine._sync_from_immich(stats=stats)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(stats["amazon_uploaded"], 1)
+        self.assertEqual(stats["icloud_uploaded"], 1)
+
+        # Verify calls to both Amazon and iCloud upload
+        engine.amazon.upload_photo.assert_called_once()
+        engine.icloud.upload_photo.assert_called_once()
+
+        # Verify DB tracked the asset with all IDs mapped
+        asset = engine.db.get_asset_by_immich_id("immich-direct-101")
+        self.assertIsNotNone(asset)
+        self.assertEqual(asset["amazon_id"], "amz-direct-node-555")
+        self.assertEqual(asset["icloud_id"], "icloud-direct-asset-777")
+        self.assertEqual(asset["filename"], "camera_card.jpg")
+        self.assertEqual(asset["status"], "ACTIVE")
+
+    def test_amazon_client_canadian_marketplace(self):
+        from src.clients.amazon import AmazonPhotosClient, RegionalAmazonPhotos
+        cfg = AmazonConfig(
+            cookies={
+                "session-id": "141-test-session",
+                "ubid-acbca": "131-test-ubid",
+                "at-acbca": "Atza|test-token"
+            },
+            tld="ca"
+        )
+        client = AmazonPhotosClient(cfg)
+        self.assertEqual(client.tld, "ca")
+        # Ensure cookie normalization populates both regional and fallback keys
+        self.assertIn("ubid-acbca", client.cookies)
+        self.assertIn("at-acbca", client.cookies)
+        self.assertIn("ubid-main", client.cookies)
+        self.assertIn("at-main", client.cookies)
+
+        # Verify RegionalAmazonPhotos subclass targets Canadian drive URL
+        with patch.object(RegionalAmazonPhotos, "__init__", return_value=None):
+            ap = RegionalAmazonPhotos.__new__(RegionalAmazonPhotos)
+            ap._target_tld = "ca"
+            self.assertEqual(ap.determine_tld(client.cookies), "ca")
+            ap.tld = "ca"
+            ap.drive_url = f"https://www.amazon.{ap.tld}/drive/v1"
+            ap.cdproxy_url = ap.determine_cdproxy(None)
+            self.assertEqual(ap.drive_url, "https://www.amazon.ca/drive/v1")
+            self.assertEqual(ap.cdproxy_url, "https://content-na.drive.amazonaws.com/cdproxy/nodes")
+
+    def test_engine_with_disabled_amazon_host(self):
+        # Configure engine with Amazon disabled
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy", enabled=True),
+            icloud=ICloudConfig(apple_id="user@icloud.com", enabled=True),
+            amazon=AmazonConfig(cookies={"session-id": "test"}, enabled=False),
+            sync=SyncSettings(
+                download_temp_dir=str(self.temp_dir.name),
+                dry_run=False,
+                enable_amazon=False
+            )
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+        self.assertFalse(engine.is_amazon_enabled)
+        self.assertTrue(engine.is_immich_enabled)
+        self.assertTrue(engine.is_icloud_enabled)
+
+        # Asset uploaded directly to Immich
+        engine.immich.get_all_assets = MagicMock(return_value=[
+            {"id": "immich-direct-disabled-amz", "originalFileName": "test.jpg"}
+        ])
+
+        def mock_download(asset_id, dest_path):
+            Path(dest_path).write_bytes(b"image bytes 123")
+            return dest_path
+
+        engine.immich.download_asset = MagicMock(side_effect=mock_download)
+        engine.amazon.upload_photo = MagicMock()
+        engine.icloud.upload_photo = MagicMock(return_value="icloud-asset-only")
+
+        stats = {"immich_direct_synced": 0, "amazon_uploaded": 0, "icloud_uploaded": 0, "errors": 0}
+        count = engine._sync_from_immich(stats=stats)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(stats["icloud_uploaded"], 1)
+        self.assertEqual(stats["amazon_uploaded"], 0)
+        # Amazon upload should NOT have been called because Amazon was disabled
+        engine.amazon.upload_photo.assert_not_called()
+        engine.icloud.upload_photo.assert_called_once()
+
+    def test_amazon_find_by_md5_queries_nodes_endpoint(self):
+        from src.clients.amazon import AmazonPhotosClient
+        cfg = AmazonConfig(cookies={"session-id": "test-session"}, tld="ca")
+        client = AmazonPhotosClient(cfg)
+
+        mock_ap = MagicMock()
+        mock_ap.drive_url = "https://www.amazon.ca/drive/v1"
+        client._ap = mock_ap
+
+        # Mock 200 response with data
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": [{"id": "node-md5-found-123"}]}
+        mock_ap.client.get.return_value = mock_resp
+
+        node_id = client.find_by_md5("6c0dab90197309050e02748a820db05c")
+        self.assertEqual(node_id, "node-md5-found-123")
+
+        # Verify it targeted /nodes with filters, not /search
+        called_url, called_kwargs = mock_ap.client.get.call_args
+        self.assertEqual(called_url[0], "https://www.amazon.ca/drive/v1/nodes")
+        self.assertIn("filters", called_kwargs["params"])
+        self.assertEqual(called_kwargs["params"]["filters"], "contentProperties.md5:6c0dab90197309050e02748a820db05c")
+
+        # Verify it handles 400 Bad Request safely without raising exception
+        mock_400_resp = MagicMock()
+        mock_400_resp.status_code = 400
+        mock_400_resp.text = '{"message":"Invalid fieldName"}'
+        mock_ap.client.get.return_value = mock_400_resp
+
+        result = client.find_by_md5("bad_hash")
+        self.assertIsNone(result)
+
+    def test_one_way_sync_skips_icloud_to_immich_ingestion(self):
+        # Configure one-way sync with Immich as master
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com", enabled=True),
+            amazon=AmazonConfig(cookies={"session-id": "test"}, enabled=True),
+            sync=SyncSettings(
+                one_way_immich_master=True,
+                ingest_from_icloud=False,
+                download_temp_dir=str(self.temp_dir.name),
+                dry_run=False
+            )
+        )
+        progress_events = []
+        engine = SyncEngine(cfg, db_path=str(self.db_path), progress_callback=lambda p: progress_events.append(p))
+
+        # Mock clients
+        engine.icloud.connect = MagicMock()
+        engine._sync_from_icloud = MagicMock()
+        engine.immich.get_all_assets = MagicMock(return_value=[])
+        engine.immich.get_albums = MagicMock(return_value=[])
+
+        stats = engine.run_sync_cycle()
+
+        # Step 1 (_sync_from_icloud) MUST NOT be called in one-way mode
+        engine._sync_from_icloud.assert_not_called()
+        self.assertEqual(stats["icloud_ingested"], 0)
+        self.assertEqual(stats["immich_uploaded"], 0)
+
+        # Progress events should reach 100%
+        self.assertTrue(len(progress_events) > 0)
+        self.assertEqual(progress_events[-1]["percent"], 100)
+        self.assertEqual(progress_events[-1]["phase"], "completed")
+
+    def test_one_way_deletion_propagation_to_amazon_and_icloud(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com", enabled=True),
+            amazon=AmazonConfig(cookies={"session-id": "test"}, enabled=True),
+            sync=SyncSettings(
+                one_way_immich_master=True,
+                sync_deletions=True,
+                download_temp_dir=str(self.temp_dir.name),
+                dry_run=False
+            )
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        # Seed asset in database that is active
+        self.db.upsert_asset(
+            sha1="del_hash_1",
+            filename="deleted_family_photo.jpg",
+            immich_id="immich-photo-to-del",
+            amazon_id="amz-node-del-1",
+            icloud_id="icloud-asset-del-1"
+        )
+
+        # Immich now returns empty assets (photo was deleted in Immich)
+        engine.immich.get_all_assets = MagicMock(return_value=[])
+
+        # Mock Amazon trash and iCloud delete
+        engine.amazon.trash_nodes = MagicMock(return_value=True)
+        mock_icloud_photo = MagicMock()
+        mock_icloud_photo.delete = MagicMock(return_value=True)
+        engine.icloud.find_photos_by_ids = MagicMock(return_value={"icloud-asset-del-1": mock_icloud_photo})
+        engine.icloud.delete_photo = MagicMock(return_value=True)
+
+        deletions_count = engine._sync_deletions()
+        self.assertEqual(deletions_count, 1)
+
+        # Verified trashed in Amazon Photos
+        engine.amazon.trash_nodes.assert_called_once_with(["amz-node-del-1"])
+
+        # Verified deleted in iCloud Photos
+        engine.icloud.delete_photo.assert_called_once_with(mock_icloud_photo)
+
+        # Verified marked DELETED_IN_IMMICH in database
+        asset = self.db.get_asset_by_immich_id("immich-photo-to-del")
+        self.assertEqual(asset["status"], "DELETED_IN_IMMICH")
+
+    def test_video_detection_utils(self):
+        from src.utils import is_video_file, is_video_asset
+
+        self.assertTrue(is_video_file("trip.mp4"))
+        self.assertTrue(is_video_file("movie.MOV"))
+        self.assertTrue(is_video_file("clip.mkv"))
+        self.assertFalse(is_video_file("photo.jpg"))
+        self.assertFalse(is_video_file("image.heic"))
+        self.assertFalse(is_video_file("raw.dng"))
+
+        video_asset_1 = {"type": "VIDEO", "originalFileName": "clip.mp4"}
+        video_asset_2 = {"type": "IMAGE", "originalMimeType": "video/mp4"}
+        video_asset_3 = {"originalFileName": "birthday.MOV"}
+        photo_asset = {"type": "IMAGE", "originalFileName": "family.jpg", "originalMimeType": "image/jpeg"}
+
+        self.assertTrue(is_video_asset(video_asset_1))
+        self.assertTrue(is_video_asset(video_asset_2))
+        self.assertTrue(is_video_asset(video_asset_3))
+        self.assertFalse(is_video_asset(photo_asset))
+
+    def test_hidden_and_locked_detection_utils(self):
+        from src.utils import is_hidden_or_locked_asset
+
+        self.assertTrue(is_hidden_or_locked_asset({"visibility": "hidden"}))
+        self.assertTrue(is_hidden_or_locked_asset({"visibility": "locked"}))
+        self.assertTrue(is_hidden_or_locked_asset({"visibility": "archive"}))
+        self.assertTrue(is_hidden_or_locked_asset({"isArchived": True}))
+        self.assertTrue(is_hidden_or_locked_asset({"isTrashed": True}))
+        self.assertTrue(is_hidden_or_locked_asset({"isLocked": True}))
+        self.assertTrue(is_hidden_or_locked_asset({"originalPath": "/data/upload/locked/secret.jpg"}))
+        self.assertTrue(is_hidden_or_locked_asset({"originalFileName": ".hidden_pic.jpg"}))
+
+        normal_asset = {"visibility": "timeline", "isArchived": False, "isTrashed": False, "originalFileName": "normal.jpg"}
+        self.assertFalse(is_hidden_or_locked_asset(normal_asset))
+
+    def test_videos_excluded_from_amazon_sync(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com", enabled=False),
+            amazon=AmazonConfig(cookies={"session-id": "test"}, enabled=True, upload_videos=False),
+            sync=SyncSettings(
+                one_way_immich_master=True,
+                sync_videos_to_amazon=False,
+                download_temp_dir=str(self.temp_dir.name),
+                dry_run=False
+            )
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        # Assets: 1 photo and 1 video
+        photo_asset = {"id": "immich-photo-1", "type": "IMAGE", "originalFileName": "photo1.jpg"}
+        video_asset = {"id": "immich-video-2", "type": "VIDEO", "originalFileName": "video2.mp4"}
+        engine.immich.get_all_assets = MagicMock(return_value=[photo_asset, video_asset])
+
+        def fake_download(asset_id, dest_path):
+            Path(dest_path).write_bytes(b"dummy image data" if "photo" in asset_id else b"dummy video data")
+
+        engine.immich.download_asset = MagicMock(side_effect=fake_download)
+        engine.amazon.find_by_md5 = MagicMock(return_value=None)
+        engine.amazon.upload_photo = MagicMock(return_value="amz-node-uploaded")
+
+        stats = {"amazon_uploaded": 0}
+        engine._sync_from_immich(stats=stats)
+
+        # Only the photo was uploaded to Amazon Photos; video was skipped!
+        self.assertEqual(engine.amazon.upload_photo.call_count, 1)
+        self.assertEqual(stats["amazon_uploaded"], 1)
+
+    def test_hidden_and_locked_assets_excluded_from_sync(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com", enabled=False),
+            amazon=AmazonConfig(cookies={"session-id": "test"}, enabled=True),
+            sync=SyncSettings(
+                one_way_immich_master=True,
+                ignore_hidden_and_locked=True,
+                download_temp_dir=str(self.temp_dir.name),
+                dry_run=False
+            )
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        hidden_asset = {"id": "immich-hidden-1", "type": "IMAGE", "visibility": "hidden", "originalFileName": "hidden.jpg"}
+        archived_asset = {"id": "immich-archived-2", "type": "IMAGE", "isArchived": True, "originalFileName": "archived.jpg"}
+        normal_asset = {"id": "immich-normal-3", "type": "IMAGE", "visibility": "timeline", "originalFileName": "normal.jpg"}
+
+        engine.immich.get_all_assets = MagicMock(return_value=[hidden_asset, archived_asset, normal_asset])
+
+        def fake_download(asset_id, dest_path):
+            Path(dest_path).write_bytes(b"normal image content")
+
+        engine.immich.download_asset = MagicMock(side_effect=fake_download)
+        engine.amazon.find_by_md5 = MagicMock(return_value=None)
+        engine.amazon.upload_photo = MagicMock(return_value="amz-normal-uploaded")
+
+        stats = {"amazon_uploaded": 0}
+        engine._sync_from_immich(stats=stats)
+
+        # Only normal asset was downloaded and uploaded; hidden/archived were completely skipped
+        self.assertEqual(engine.immich.download_asset.call_count, 1)
+        self.assertEqual(engine.amazon.upload_photo.call_count, 1)
+
+    def test_env_file_bootstrap_and_overrides(self):
+        cfg_file = Path(self.temp_dir.name) / "config.json"
+        env_file = Path(self.temp_dir.name) / ".env"
+
+        # 1. Bootstrap when config.json does not exist yet
+        env_file.write_text(
+            "\n".join([
+                "IMMICH_URL=http://192.168.1.50:2283",
+                "IMMICH_API_KEY=env-api-key",
+                "ICLOUD_APPLE_ID=env@icloud.com",
+                "ICLOUD_UPLOAD_VIDEOS=false",
+                "AMAZON_TLD=ca",
+                "AMAZON_SESSION_ID=env-sess-1",
+                "AMAZON_UBID=env-ubid-2",
+                "AMAZON_AT_TOKEN=Atza|env-token-3",
+                "POLL_INTERVAL_SECONDS=180",
+            ]),
+            encoding="utf-8",
+        )
+        self.assertFalse(cfg_file.exists())
+
+        bootstrapped = load_config(cfg_file)
+        self.assertTrue(cfg_file.exists())
+        self.assertEqual(bootstrapped.immich.url, "http://192.168.1.50:2283")
+        self.assertEqual(bootstrapped.immich.api_key, "env-api-key")
+        self.assertEqual(bootstrapped.icloud.apple_id, "env@icloud.com")
+        self.assertFalse(bootstrapped.icloud.upload_videos)
+        self.assertFalse(bootstrapped.sync.sync_videos_to_icloud)
+        self.assertEqual(bootstrapped.amazon.tld, "ca")
+        self.assertEqual(bootstrapped.amazon.cookies["session-id"], "env-sess-1")
+        self.assertEqual(bootstrapped.amazon.cookies["ubid-acbca"], "env-ubid-2")
+        self.assertEqual(bootstrapped.amazon.cookies["at-acbca"], "Atza|env-token-3")
+        self.assertEqual(bootstrapped.sync.poll_interval_seconds, 180)
+
+        # 2. Override existing config.json values via updated .env without wiping untouched fields
+        env_file.write_text(
+            "\n".join([
+                "IMMICH_URL=http://192.168.1.99:2283",
+                "IMMICH_API_KEY=",
+                "POLL_INTERVAL_SECONDS=600",
+                "ICLOUD_UPLOAD_VIDEOS=true",
+            ]),
+            encoding="utf-8",
+        )
+        overridden = load_config(cfg_file)
+        self.assertEqual(overridden.immich.url, "http://192.168.1.99:2283")
+        self.assertEqual(overridden.immich.api_key, "env-api-key")
+        self.assertEqual(overridden.sync.poll_interval_seconds, 600)
+        self.assertTrue(overridden.icloud.upload_videos)
+        self.assertTrue(overridden.sync.sync_videos_to_icloud)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,17 @@
+.venv/
+.git/
+__pycache__/
+*.pyc
+*.pyo
+.temp/
+.icloud_session/
+.amazon_browser_profile/
+config.json
+.env
+sync_state.db
+sync_state.db-*
+log.log
+tests/
+data/
+scratch/
+orphans_list.json

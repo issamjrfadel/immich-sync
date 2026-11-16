@@ -1,0 +1,26 @@
+services:
+  immich-sync:
+    # Once hosted on GHCR, comment out `build: .` and use your hosted image:
+    # image: ghcr.io/<your-github-username>/immich-sync:latest
+    build: .
+    image: immich-sync:latest
+    container_name: immich-sync
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "5050:5050"
+    volumes:
+      # On Unraid, map your appdata share here, e.g.:
+      # - /mnt/user/appdata/immich-sync:/app/data
+      - ./data:/app/data
+    environment:
+      - TZ=America/Toronto
+      - DATA_DIR=/app/data
+      - AUTO_DAEMON=true
+      - HOST=0.0.0.0
+      - PORT=5050
+      # Set DASHBOARD_PASSWORD to enable HTTP Basic Auth on the Web UI
+      - DASHBOARD_USER=admin
+      - DASHBOARD_PASSWORD=

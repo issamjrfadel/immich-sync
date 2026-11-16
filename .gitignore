@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+config.json
+.env
+.icloud_session/
+.temp/
+sync_state.db
+sync_state.db-journal
+ap.parquet
+*.log
+.amazon_browser_profile/
+scratch/

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>immich-sync</Name>
+  <Repository>ghcr.io/YOUR_GITHUB_USERNAME/immich-sync:latest</Repository>
+  <Registry>https://ghcr.io</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>Immich Multi-Sync Hub: One-way sync from Immich (master) to Amazon Photos and iCloud Photos with Web UI and continuous background daemon. Place a .env file in /mnt/user/appdata/immich-sync/.env to configure all credentials and settings automatically.</Overview>
+  <Category>MediaApp:Photos Tools:</Category>
+  <WebUI>http://[IP]:[PORT:5050]/</WebUI>
+  <TemplateURL/>
+  <Icon>https://raw.githubusercontent.com/immich-app/immich/main/design/immich-logo.svg</Icon>
+  <ExtraParams>--restart unless-stopped</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="Web UI Port" Target="5050" Default="5050" Mode="tcp" Description="Immich Multi-Sync Web Dashboard port" Type="Port" Display="always" Required="true" Mask="false">5050</Config>
+  <Config Name="AppData Directory" Target="/app/data" Default="/mnt/user/appdata/immich-sync" Mode="rw" Description="Persistent folder for .env (auto-loaded), config.json, sync_state.db, .icloud_session, and temp staging" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/immich-sync</Config>
+  <Config Name="Auto-Start Sync Daemon" Target="AUTO_DAEMON" Default="true" Mode="" Description="Automatically start the continuous background sync daemon when the container boots (true/false)" Type="Variable" Display="always" Required="true" Mask="false">true</Config>
+  <Config Name="Timezone" Target="TZ" Default="America/Toronto" Mode="" Description="Container timezone (e.g. America/Toronto, America/New_York, UTC)" Type="Variable" Display="always" Required="false" Mask="false">America/Toronto</Config>
+  <Config Name="Data Directory" Target="DATA_DIR" Default="/app/data" Mode="" Description="Internal path inside container for persistent files" Type="Variable" Display="advanced" Required="true" Mask="false">/app/data</Config>
+  <Config Name="Dashboard Username" Target="DASHBOARD_USER" Default="admin" Mode="" Description="Username for Web UI HTTP Basic Auth (used when Dashboard Password is set)" Type="Variable" Display="always" Required="false" Mask="false">admin</Config>
+  <Config Name="Dashboard Password" Target="DASHBOARD_PASSWORD" Default="" Mode="" Description="Optional password to protect the Web UI with HTTP Basic Auth (recommended on Unraid LAN)" Type="Variable" Display="always" Required="false" Mask="true"></Config>
+</Container>

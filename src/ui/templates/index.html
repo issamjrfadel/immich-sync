@@ -1,0 +1,1801 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Immich Multi-Sync Hub</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: {
+              50: '#eef2ff',
+              500: '#6366f1',
+              600: '#4f46e5',
+              700: '#4338ca',
+            },
+            darkbg: '#0f172a',
+            darkcard: '#1e293b',
+            darkborder: '#334155'
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Custom scrollbar for terminal */
+    .terminal-scroll::-webkit-scrollbar { width: 6px; }
+    .terminal-scroll::-webkit-scrollbar-track { background: #0b0f19; }
+    .terminal-scroll::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+  </style>
+</head>
+<body class="bg-darkbg text-slate-100 min-h-screen font-sans flex flex-col antialiased selection:bg-brand-500 selection:text-white">
+
+  <!-- TOP NAVIGATION BAR -->
+  <header class="border-b border-darkborder bg-darkcard/80 backdrop-blur sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+      <div class="flex items-center space-x-3">
+        <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-brand-500 to-pink-500 flex items-center justify-center shadow-lg shadow-indigo-500/30">
+          <i class="fa-solid fa-cloud-arrow-up text-white text-lg"></i>
+        </div>
+        <div>
+          <h1 class="font-bold text-lg leading-tight tracking-tight flex items-center gap-2">
+            Immich Multi-Sync
+            <span class="text-xs font-mono py-0.5 px-2 rounded-full bg-brand-500/20 text-brand-300 border border-brand-500/30">v1.0</span>
+            <span id="oneWayBadge" class="text-xs font-sans py-0.5 px-2.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 flex items-center gap-1.5 font-medium"><i class="fa-solid fa-arrow-right text-[10px]"></i> One-Way Mode (Immich Master)</span>
+          </h1>
+          <p class="text-xs text-slate-400">Immich (Master) → Amazon Photos & iCloud Photos</p>
+        </div>
+      </div>
+
+      <!-- Live Syncing Indicator & Quick Controls -->
+      <div class="flex items-center space-x-3">
+        <div id="syncStatusBadge" class="hidden items-center space-x-2 bg-indigo-950/60 border border-indigo-500/40 text-indigo-300 text-xs px-3 py-1.5 rounded-full animate-pulse">
+          <i id="syncStatusIcon" class="fa-solid fa-arrows-rotate animate-spin"></i>
+          <span id="syncStatusText">Syncing Active</span>
+        </div>
+
+        <!-- Real-time pause/resume and stop controls (visible during active sync) -->
+        <div id="syncActiveControls" class="hidden items-center space-x-2">
+          <button onclick="togglePauseSync()" id="syncPauseBtn" title="Pause or Resume Sync" class="flex items-center space-x-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-medium px-3 py-1.5 rounded-lg text-xs transition-all active:scale-95">
+            <i id="syncPauseIcon" class="fa-solid fa-pause text-xs"></i>
+            <span id="syncPauseText">Pause</span>
+          </button>
+          <button onclick="stopSync()" id="syncStopBtn" title="Stop Active Sync" class="flex items-center space-x-1.5 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 font-medium px-3 py-1.5 rounded-lg text-xs transition-all active:scale-95">
+            <i class="fa-solid fa-stop text-xs"></i>
+            <span>Stop</span>
+          </button>
+        </div>
+
+        <button onclick="triggerSync()" id="syncBtn" class="flex items-center space-x-2 bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 text-white font-medium px-4 py-2 rounded-lg shadow-md shadow-brand-600/20 active:scale-95 transition-all text-sm">
+          <i class="fa-solid fa-play text-xs"></i>
+          <span>Sync Now</span>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- NAVIGATION TABS -->
+  <div class="border-b border-darkborder bg-darkcard/40">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex space-x-8 text-sm font-medium">
+      <button onclick="switchTab('dashboard')" id="tab-btn-dashboard" class="tab-btn py-3.5 border-b-2 border-brand-500 text-brand-400 flex items-center space-x-2">
+        <i class="fa-solid fa-chart-pie"></i>
+        <span>Dashboard</span>
+      </button>
+      <button onclick="switchTab('albums')" id="tab-btn-albums" class="tab-btn py-3.5 border-b-2 border-transparent text-slate-400 hover:text-slate-200 flex items-center space-x-2">
+        <i class="fa-solid fa-images"></i>
+        <span>Albums</span>
+      </button>
+      <button onclick="switchTab('assets')" id="tab-btn-assets" class="tab-btn py-3.5 border-b-2 border-transparent text-slate-400 hover:text-slate-200 flex items-center space-x-2">
+        <i class="fa-solid fa-database"></i>
+        <span>Tracked Assets</span>
+      </button>
+      <button onclick="switchTab('settings')" id="tab-btn-settings" class="tab-btn py-3.5 border-b-2 border-transparent text-slate-400 hover:text-slate-200 flex items-center space-x-2">
+        <i class="fa-solid fa-sliders"></i>
+        <span>Configuration</span>
+      </button>
+    </div>
+  </div>
+
+  <!-- MAIN CONTAINER -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1 w-full">
+
+    <!-- TAB 1: DASHBOARD -->
+    <div id="tab-dashboard" class="space-y-6">
+
+      <!-- SERVICE HEALTH CARDS -->
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+        <!-- IMMICH -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-5 relative overflow-hidden">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+              <div class="w-10 h-10 rounded-xl bg-purple-500/20 text-purple-400 flex items-center justify-center text-lg">
+                <i class="fa-solid fa-server"></i>
+              </div>
+              <div>
+                <h3 class="font-semibold text-slate-100">Immich</h3>
+                <span class="text-xs text-slate-400">Self-Hosted Hub</span>
+              </div>
+            </div>
+            <div class="flex items-center space-x-2">
+              <label class="relative inline-flex items-center cursor-pointer" title="Enable/Disable Immich in sync">
+                <input type="checkbox" id="hostToggleImmich" checked onchange="toggleHostQuick('immich', this.checked)" class="sr-only peer">
+                <div class="w-8 h-4 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-purple-600"></div>
+              </label>
+              <span id="immichStatusPill" class="text-xs px-2.5 py-1 rounded-full font-medium bg-slate-800 text-slate-400 border border-slate-700">Checking...</span>
+            </div>
+          </div>
+          <div class="mt-4 pt-3 border-t border-darkborder/60 text-xs text-slate-400 truncate flex items-center justify-between">
+            <span id="immichDetails">Connecting to instance...</span>
+            <button onclick="testService('immich')" class="text-brand-400 hover:text-brand-300 font-medium">Test</button>
+          </div>
+        </div>
+
+        <!-- ICLOUD -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-5 relative overflow-hidden">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+              <div class="w-10 h-10 rounded-xl bg-blue-500/20 text-blue-400 flex items-center justify-center text-lg">
+                <i class="fa-brands fa-apple"></i>
+              </div>
+              <div>
+                <h3 class="font-semibold text-slate-100">iCloud Photos</h3>
+                <span class="text-xs text-slate-400">Apple Ingestion</span>
+              </div>
+            </div>
+            <div class="flex items-center space-x-2">
+              <label class="relative inline-flex items-center cursor-pointer" title="Enable/Disable iCloud in sync">
+                <input type="checkbox" id="hostToggleIcloud" checked onchange="toggleHostQuick('icloud', this.checked)" class="sr-only peer">
+                <div class="w-8 h-4 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+              <span id="icloudStatusPill" class="text-xs px-2.5 py-1 rounded-full font-medium bg-slate-800 text-slate-400 border border-slate-700">Checking...</span>
+            </div>
+          </div>
+          <div class="mt-4 pt-3 border-t border-darkborder/60 text-xs text-slate-400 truncate flex items-center justify-between">
+            <span id="icloudDetails">Checking session...</span>
+            <div class="flex space-x-2">
+              <button onclick="open2FAModal()" id="icloud2FABtn" class="hidden text-amber-400 hover:text-amber-300 font-medium">Verify 2FA</button>
+              <button onclick="testService('icloud')" class="text-brand-400 hover:text-brand-300 font-medium">Test</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- AMAZON PHOTOS -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-5 relative overflow-hidden">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center space-x-3">
+              <div class="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center text-lg">
+                <i class="fa-brands fa-amazon"></i>
+              </div>
+              <div>
+                <h3 class="font-semibold text-slate-100">Amazon Photos</h3>
+                <span id="amazonRegionLabel" class="text-xs text-slate-400">amazon.ca (Canada)</span>
+              </div>
+            </div>
+            <div class="flex items-center space-x-2">
+              <label class="relative inline-flex items-center cursor-pointer" title="Enable/Disable Amazon Photos in sync">
+                <input type="checkbox" id="hostToggleAmazon" checked onchange="toggleHostQuick('amazon', this.checked)" class="sr-only peer">
+                <div class="w-8 h-4 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-amber-600"></div>
+              </label>
+              <span id="amazonStatusPill" class="text-xs px-2.5 py-1 rounded-full font-medium bg-slate-800 text-slate-400 border border-slate-700">Checking...</span>
+            </div>
+          </div>
+          <div class="mt-4 pt-3 border-t border-darkborder/60 text-xs text-slate-400 truncate flex items-center justify-between">
+            <span id="amazonDetails">Verifying cookies...</span>
+            <div class="flex items-center space-x-2">
+              <button onclick="openAmazonLoginModal()" class="text-amber-400 hover:text-amber-300 font-medium flex items-center gap-1" title="1-Click Browser Sign-In (Auto-Captures Cookies)"><i class="fa-solid fa-arrow-right-to-bracket text-[10px]"></i> <span>Sign In</span></button>
+              <button onclick="openBookmarkletModal()" class="text-slate-400 hover:text-slate-300 font-medium flex items-center gap-1" title="Bookmarklet alternative"><i class="fa-solid fa-bookmark text-[10px]"></i> <span>Bookmarklet</span></button>
+              <button onclick="testService('amazon')" class="text-brand-400 hover:text-brand-300 font-medium">Test</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SYNC METRICS COUNTERS -->
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+        <div class="bg-darkcard border border-darkborder rounded-xl p-4">
+          <span class="text-xs text-slate-400 block mb-1">Tracked Assets</span>
+          <span id="statActiveAssets" class="text-2xl font-bold text-white">0</span>
+        </div>
+        <div class="bg-darkcard border border-darkborder rounded-xl p-4">
+          <span class="text-xs text-slate-400 block mb-1">iCloud Ingested</span>
+          <span id="statIcloudIngested" class="text-2xl font-bold text-blue-400">0</span>
+        </div>
+        <div class="bg-darkcard border border-darkborder rounded-xl p-4">
+          <span class="text-xs text-slate-400 block mb-1">Immich Uploads</span>
+          <span id="statImmichUploaded" class="text-2xl font-bold text-purple-400">0</span>
+        </div>
+        <div class="bg-darkcard border border-darkborder rounded-xl p-4">
+          <span class="text-xs text-slate-400 block mb-1">Amazon Uploads</span>
+          <span id="statAmazonUploaded" class="text-2xl font-bold text-amber-400">0</span>
+        </div>
+        <div class="bg-darkcard border border-darkborder rounded-xl p-4">
+          <span class="text-xs text-slate-400 block mb-1">iCloud Uploads</span>
+          <span id="statIcloudUploaded" class="text-2xl font-bold text-indigo-400">0</span>
+        </div>
+        <div class="bg-darkcard border border-darkborder rounded-xl p-4">
+          <span class="text-xs text-slate-400 block mb-1">Deletions Synced</span>
+          <span id="statDeletionsSynced" class="text-2xl font-bold text-red-400">0</span>
+        </div>
+      </div>
+
+      <!-- SYNC RUNNER OPTIONS & CONTROLS -->
+      <div class="bg-darkcard border border-darkborder rounded-2xl p-5 flex flex-wrap items-center justify-between gap-4">
+        <div class="flex flex-wrap items-center gap-5 text-sm">
+          <!-- Active Hosts Selector -->
+          <div class="flex items-center space-x-3 pr-4 border-r border-darkborder/70">
+            <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Hosts:</span>
+            <label class="flex items-center space-x-1.5 cursor-pointer select-none text-xs">
+              <input type="checkbox" id="runHostImmich" checked class="rounded border-darkborder text-purple-500 focus:ring-0 bg-slate-900 w-3.5 h-3.5">
+              <span class="text-slate-300 font-medium">Immich</span>
+            </label>
+            <label class="flex items-center space-x-1.5 cursor-pointer select-none text-xs">
+              <input type="checkbox" id="runHostIcloud" checked class="rounded border-darkborder text-blue-500 focus:ring-0 bg-slate-900 w-3.5 h-3.5">
+              <span class="text-slate-300 font-medium">iCloud</span>
+            </label>
+            <label class="flex items-center space-x-1.5 cursor-pointer select-none text-xs">
+              <input type="checkbox" id="runHostAmazon" checked class="rounded border-darkborder text-amber-500 focus:ring-0 bg-slate-900 w-3.5 h-3.5">
+              <span class="text-slate-300 font-medium">Amazon</span>
+            </label>
+          </div>
+
+          <label class="flex items-center space-x-2 cursor-pointer select-none">
+            <input type="checkbox" id="optDryRun" class="rounded border-darkborder text-brand-500 focus:ring-brand-500 bg-slate-900 w-4 h-4">
+            <span class="text-slate-300">Dry Run (Simulate only)</span>
+          </label>
+          <label class="flex items-center space-x-2 cursor-pointer select-none">
+            <input type="checkbox" id="optForceDeletes" class="rounded border-darkborder text-brand-500 focus:ring-brand-500 bg-slate-900 w-4 h-4">
+            <span class="text-slate-300">Force Deletions (Bypass limit)</span>
+          </label>
+        </div>
+
+        <!-- Continuous Daemon Switch -->
+        <div class="flex items-center space-x-3 bg-slate-900/60 border border-darkborder px-4 py-2 rounded-xl">
+          <div class="flex flex-col text-right">
+            <span class="text-xs font-semibold text-slate-200">Continuous Daemon</span>
+            <span id="daemonStatusText" class="text-[10px] text-slate-400">Stopped</span>
+          </div>
+          <button onclick="toggleDaemon()" id="daemonToggleBtn" class="w-12 h-6 bg-slate-700 rounded-full relative p-0.5 transition-colors duration-200 ease-in-out focus:outline-none">
+            <div id="daemonToggleCircle" class="w-5 h-5 bg-white rounded-full shadow-md transform transition-transform duration-200 ease-in-out"></div>
+          </button>
+        </div>
+      </div>
+
+      <!-- DYNAMIC SYNC PROGRESS PANEL WITH % TRACKING -->
+      <div id="syncProgressCard" class="bg-darkcard border border-darkborder rounded-2xl p-5 shadow-lg space-y-3 transition-all duration-300">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-3">
+            <div id="progressStatusIcon" class="w-9 h-9 rounded-xl bg-slate-800 text-slate-400 flex items-center justify-center text-sm border border-darkborder/70">
+              <i class="fa-solid fa-cloud-arrow-up"></i>
+            </div>
+            <div>
+              <div class="flex items-center space-x-2">
+                <h4 id="progressPhaseTitle" class="font-bold text-sm text-slate-100">Ready to Sync</h4>
+                <span id="progressPhaseBadge" class="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">Idle</span>
+              </div>
+              <p id="progressActionDesc" class="text-xs text-slate-400 truncate max-w-md md:max-w-xl">Immich is configured as the master source. Click "Sync Now" to start.</p>
+            </div>
+          </div>
+          <div class="flex items-center space-x-4">
+            <!-- Inline controls for pause & stop in progress card -->
+            <div id="progressActionButtons" class="hidden items-center space-x-2">
+              <button onclick="togglePauseSync()" id="cardPauseBtn" class="flex items-center space-x-1.5 bg-amber-500/10 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition-all active:scale-95">
+                <i id="cardPauseIcon" class="fa-solid fa-pause text-xs"></i>
+                <span id="cardPauseText">Pause</span>
+              </button>
+              <button onclick="stopSync()" id="cardStopBtn" class="flex items-center space-x-1.5 bg-rose-500/10 hover:bg-rose-500/25 text-rose-300 border border-rose-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition-all active:scale-95">
+                <i class="fa-solid fa-stop text-xs"></i>
+                <span>Stop</span>
+              </button>
+            </div>
+            <div class="text-right">
+              <div class="flex items-baseline justify-end space-x-1">
+                <span id="progressPercentLabel" class="text-2xl font-black font-mono text-brand-400">0%</span>
+              </div>
+              <span id="progressCountsLabel" class="block text-[11px] font-mono text-slate-500">Ready</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Animated Progress Bar -->
+        <div class="w-full bg-slate-900 rounded-full h-3.5 p-0.5 border border-darkborder/80 overflow-hidden relative shadow-inner">
+          <div id="progressBarFill" class="h-full bg-gradient-to-r from-brand-500 via-indigo-500 to-purple-500 rounded-full transition-all duration-300 ease-out relative shadow-lg shadow-brand-500/20" style="width: 0%">
+            <div id="progressBarShimmer" class="absolute inset-0 bg-white/20 animate-pulse hidden rounded-full"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- LIVE LOG TERMINAL -->
+      <div class="bg-darkcard border border-darkborder rounded-2xl overflow-hidden shadow-xl flex flex-col h-96">
+        <div class="bg-slate-900/80 px-4 py-2.5 border-b border-darkborder flex items-center justify-between text-xs">
+          <div class="flex items-center space-x-2">
+            <span class="w-3 h-3 rounded-full bg-red-500/80 inline-block"></span>
+            <span class="w-3 h-3 rounded-full bg-amber-500/80 inline-block"></span>
+            <span class="w-3 h-3 rounded-full bg-green-500/80 inline-block"></span>
+            <span class="ml-2 font-mono text-slate-400 flex items-center gap-1.5">
+              <i class="fa-solid fa-terminal text-slate-500"></i>
+              Live Activity Stream
+            </span>
+          </div>
+          <div class="flex items-center space-x-3 text-slate-400">
+            <label class="flex items-center space-x-1 cursor-pointer text-[11px]">
+              <input type="checkbox" id="autoScrollCheck" checked class="rounded border-darkborder bg-slate-800 text-brand-500 focus:ring-0 w-3.5 h-3.5">
+              <span>Auto-scroll</span>
+            </label>
+            <button onclick="clearTerminal()" class="hover:text-slate-200 transition-colors">
+              <i class="fa-solid fa-trash-can mr-1"></i> Clear
+            </button>
+          </div>
+        </div>
+
+        <div id="terminal" class="terminal-scroll flex-1 p-4 font-mono text-xs overflow-y-auto space-y-1.5 bg-[#0b0f19]">
+          <div class="text-slate-500 italic">[Waiting for log events...]</div>
+        </div>
+      </div>
+
+    </div>
+
+    <!-- TAB 2: ALBUMS -->
+    <div id="tab-albums" class="hidden space-y-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-xl font-bold text-slate-100">Synchronized Albums</h2>
+          <p class="text-xs text-slate-400">Immich album structures mapped to Amazon Photos and iCloud Photos</p>
+        </div>
+        <button onclick="fetchAlbums()" class="bg-darkcard border border-darkborder hover:bg-slate-800 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center space-x-1.5 text-slate-300">
+          <i class="fa-solid fa-arrows-rotate"></i>
+          <span>Refresh</span>
+        </button>
+      </div>
+
+      <div id="albumsContainer" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
+        <div class="text-slate-400 text-sm italic col-span-3 text-center py-12">Loading albums...</div>
+      </div>
+    </div>
+
+    <!-- TAB 3: TRACKED ASSETS -->
+    <div id="tab-assets" class="hidden space-y-6">
+      <div class="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 class="text-xl font-bold text-slate-100">Tracked Media Assets</h2>
+          <p class="text-xs text-slate-400">Deduplicated catalog mapped across all three photo services</p>
+        </div>
+        <div class="flex items-center space-x-3">
+          <div class="relative">
+            <i class="fa-solid fa-magnifying-glass absolute left-3 top-2.5 text-slate-400 text-xs"></i>
+            <input type="text" id="assetSearchInput" oninput="searchAssets()" placeholder="Search filename or hash..." class="bg-darkcard border border-darkborder text-xs rounded-lg pl-8 pr-3 py-2 text-slate-200 focus:outline-none focus:border-brand-500 w-64">
+          </div>
+          <button onclick="fetchAssets()" class="bg-darkcard border border-darkborder hover:bg-slate-800 px-3 py-2 rounded-lg text-xs font-medium text-slate-300">
+            <i class="fa-solid fa-arrows-rotate"></i>
+          </button>
+        </div>
+      </div>
+
+      <div class="bg-darkcard border border-darkborder rounded-2xl overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="w-full text-left text-xs">
+            <thead class="bg-slate-900/60 text-slate-400 font-semibold border-b border-darkborder">
+              <tr>
+                <th class="p-3.5">Filename</th>
+                <th class="p-3.5">Status</th>
+                <th class="p-3.5">SHA-1 / MD5</th>
+                <th class="p-3.5">Immich ID</th>
+                <th class="p-3.5">Amazon ID</th>
+                <th class="p-3.5">iCloud ID</th>
+                <th class="p-3.5">Last Synced</th>
+              </tr>
+            </thead>
+            <tbody id="assetsTableBody" class="divide-y divide-darkborder/50 text-slate-300 font-mono">
+              <tr><td colspan="7" class="p-8 text-center text-slate-500 font-sans italic">Loading assets...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: SETTINGS / CONFIGURATION -->
+    <div id="tab-settings" class="hidden space-y-6">
+      <div class="flex items-center justify-between">
+        <div>
+          <h2 class="text-xl font-bold text-slate-100">Configuration & Credentials</h2>
+          <p class="text-xs text-slate-400">Settings are persisted securely in your local <code class="text-brand-300">config.json</code></p>
+        </div>
+        <div class="flex items-center space-x-3">
+          <span id="saveConfigResult" class="hidden text-xs font-semibold px-3 py-1.5 rounded-lg"></span>
+          <button onclick="saveConfiguration()" id="btnSaveConfig" class="bg-brand-600 hover:bg-brand-500 text-white font-medium px-4 py-2 rounded-lg text-sm shadow-md transition-colors flex items-center space-x-2">
+            <i class="fa-solid fa-floppy-disk text-xs"></i>
+            <span>Save Settings</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        <!-- IMMICH SETTINGS -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-6 space-y-4">
+          <div class="flex items-center justify-between">
+            <h3 class="font-bold text-base flex items-center gap-2 text-purple-400">
+              <i class="fa-solid fa-server"></i> Immich Settings
+            </h3>
+            <label class="flex items-center space-x-1.5 cursor-pointer text-xs">
+              <input type="checkbox" id="cfg_immich_enabled" checked class="rounded border-darkborder text-purple-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+              <span class="text-slate-300">Enabled</span>
+            </label>
+          </div>
+          <div class="space-y-3 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1">Server URL</label>
+              <input type="text" id="cfg_immich_url" placeholder="http://192.168.1.100:2283" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-purple-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">API Key</label>
+              <input type="password" id="cfg_immich_api_key" placeholder="Immich API Key" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-purple-500 focus:outline-none">
+            </div>
+            <div class="flex items-center justify-between pt-2">
+              <label class="flex items-center space-x-2 cursor-pointer">
+                <input type="checkbox" id="cfg_immich_verify_ssl" checked class="rounded border-darkborder text-purple-500 focus:ring-0 w-4 h-4 bg-slate-900">
+                <span class="text-slate-300">Verify SSL</span>
+              </label>
+              <button onclick="testService('immich')" id="btnTestImmich" class="text-xs bg-purple-600/30 hover:bg-purple-600/40 text-purple-300 border border-purple-500/40 px-3 py-1.5 rounded-lg font-medium flex items-center space-x-1.5 transition-colors">
+                <i class="fa-solid fa-bolt"></i>
+                <span>Test Connection</span>
+              </button>
+            </div>
+            <div id="immichTestResult" class="hidden text-xs p-2.5 rounded-lg mt-2 font-medium"></div>
+          </div>
+        </div>
+
+        <!-- ICLOUD SETTINGS -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-6 space-y-4">
+          <div class="flex items-center justify-between">
+            <h3 class="font-bold text-base flex items-center gap-2 text-blue-400">
+              <i class="fa-brands fa-apple"></i> iCloud Photos Settings
+            </h3>
+            <label class="flex items-center space-x-1.5 cursor-pointer text-xs">
+              <input type="checkbox" id="cfg_icloud_enabled" checked class="rounded border-darkborder text-blue-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+              <span class="text-slate-300">Enabled</span>
+            </label>
+          </div>
+          <div class="space-y-3 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1">Apple ID Email</label>
+              <input type="text" id="cfg_icloud_apple_id" placeholder="your_email@icloud.com" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-blue-500 focus:outline-none">
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">Apple ID Password</label>
+              <input type="password" id="cfg_icloud_password" placeholder="••••••••" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-blue-500 focus:outline-none">
+            </div>
+            <div class="pt-1 pb-1">
+              <label class="flex items-center space-x-2 cursor-pointer select-none">
+                <input type="checkbox" id="cfg_icloud_upload_videos" checked class="rounded border-darkborder text-blue-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                <span class="text-slate-300 font-medium">Import Videos from Immich to iCloud</span>
+              </label>
+              <span class="text-[10px] text-slate-500 mt-0.5 block">Checked = upload both photos and videos from Immich into iCloud Photos.</span>
+            </div>
+            <div class="pt-2 flex items-center justify-between">
+              <button onclick="open2FAModal()" class="bg-blue-600/30 hover:bg-blue-600/40 text-blue-300 border border-blue-500/40 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center space-x-1.5">
+                <i class="fa-solid fa-shield-halved"></i>
+                <span>Trigger 2FA Verification</span>
+              </button>
+              <button onclick="testService('icloud')" id="btnTestICloud" class="text-xs bg-blue-600/30 hover:bg-blue-600/40 text-blue-300 border border-blue-500/40 px-3 py-1.5 rounded-lg font-medium flex items-center space-x-1.5 transition-colors">
+                <i class="fa-solid fa-bolt"></i>
+                <span>Test</span>
+              </button>
+            </div>
+            <div id="icloudTestResult" class="hidden text-xs p-2.5 rounded-lg mt-2 font-medium"></div>
+          </div>
+        </div>
+
+        <!-- AMAZON PHOTOS SETTINGS -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-6 space-y-4">
+          <div class="flex items-center justify-between">
+            <h3 class="font-bold text-base flex items-center gap-2 text-amber-400">
+              <i class="fa-brands fa-amazon"></i> Amazon Photos Settings
+            </h3>
+            <div class="flex items-center space-x-2.5">
+              <span class="text-[10px] bg-amber-500/20 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded-full font-mono">amazon.ca</span>
+              <label class="flex items-center space-x-1.5 cursor-pointer text-xs">
+                <input type="checkbox" id="cfg_amazon_enabled" checked class="rounded border-darkborder text-amber-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                <span class="text-slate-300">Enabled</span>
+              </label>
+            </div>
+          </div>
+          <div class="space-y-3 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1">Marketplace / Endpoint</label>
+              <select id="cfg_amazon_tld" onchange="updateAmazonCookieLabels()" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-amber-500 focus:outline-none">
+                <option value="ca" selected>Canada (https://www.amazon.ca/photos)</option>
+                <option value="com">United States (https://www.amazon.com/photos)</option>
+                <option value="co.uk">United Kingdom (https://www.amazon.co.uk/photos)</option>
+                <option value="de">Germany (https://www.amazon.de/photos)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1">session-id cookie</label>
+              <input type="text" id="cfg_amazon_session_id" placeholder="123-4567890-..." class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-amber-500 focus:outline-none font-mono">
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1" id="lbl_amazon_ubid">ubid-acbca cookie (or ubid-main)</label>
+              <input type="text" id="cfg_amazon_ubid_main" placeholder="123-4567890-..." class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-amber-500 focus:outline-none font-mono">
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1" id="lbl_amazon_at">at-acbca cookie (or at-main)</label>
+              <input type="password" id="cfg_amazon_at_main" placeholder="Atza|..." class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-amber-500 focus:outline-none font-mono">
+            </div>
+            <div class="pt-1 pb-1">
+              <label class="flex items-center space-x-2 cursor-pointer select-none">
+                <input type="checkbox" id="cfg_amazon_upload_videos" class="rounded border-darkborder text-amber-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                <span class="text-slate-300 font-medium">Upload Video Files to Amazon</span>
+              </label>
+              <span class="text-[10px] text-slate-500 mt-0.5 block">Unchecked = pictures/photos only (protects your 5GB Amazon video quota).</span>
+            </div>
+            <div class="pt-2 flex items-center justify-between">
+              <button type="button" onclick="openAmazonLoginModal()" class="bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 text-slate-950 font-bold px-3 py-1.5 rounded-lg text-xs shadow-md shadow-amber-500/20 flex items-center gap-1.5 transition-all">
+                <i class="fa-solid fa-arrow-right-to-bracket text-xs"></i>
+                <span>Sign In with Amazon (Auto-Capture)</span>
+              </button>
+              <button onclick="testService('amazon')" id="btnTestAmazon" class="text-xs bg-amber-600/30 hover:bg-amber-600/40 text-amber-300 border border-amber-500/40 px-3 py-1.5 rounded-lg font-medium flex items-center space-x-1.5 transition-colors">
+                <i class="fa-solid fa-bolt"></i>
+                <span>Test</span>
+              </button>
+            </div>
+            <div id="amazonTestResult" class="hidden text-xs p-2.5 rounded-lg mt-2 font-medium"></div>
+
+            <!-- 1-Click Bookmarklet Helper Box -->
+            <div class="bg-slate-900/90 border border-amber-500/30 rounded-xl p-3.5 space-y-2.5 mt-3">
+              <div class="flex items-center justify-between">
+                <span class="font-bold text-amber-400 text-xs flex items-center gap-1.5">
+                  <i class="fa-solid fa-bookmark"></i> 1-Click Cookie Bookmarklet
+                </span>
+                <span class="text-[10px] text-slate-400">Zero F12 DevTools</span>
+              </div>
+              <p class="text-[11px] text-slate-300 leading-normal">
+                Drag this button to your browser's Bookmarks bar. Whenever cookies expire, visit <a href="https://www.amazon.ca/photos" target="_blank" class="text-amber-400 hover:underline">amazon.ca/photos</a> and click it!
+              </p>
+              <div class="flex items-center space-x-2 pt-1">
+                <a id="amazonBookmarkletLink" href="#" class="cursor-grab active:cursor-grabbing text-xs bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 text-slate-950 font-bold px-3 py-1.5 rounded-lg shadow-md shadow-amber-500/20 flex items-center gap-1.5 select-none" onclick="event.preventDefault(); showToast('Drag this button to your Bookmarks bar, or click Copy Code!', 'success');">
+                  <i class="fa-solid fa-bolt"></i>
+                  <span>🔖 Sync Amazon Cookies</span>
+                </a>
+                <button type="button" onclick="copyBookmarkletCode()" class="text-[11px] bg-slate-800 hover:bg-slate-700 text-slate-300 px-2.5 py-1.5 rounded-lg border border-darkborder font-medium flex items-center gap-1">
+                  <i class="fa-regular fa-copy"></i>
+                  <span>Copy Code</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- GENERAL SYNC POLICIES -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-6 space-y-4 lg:col-span-3">
+          <h3 class="font-bold text-base flex items-center gap-2 text-slate-200">
+            <i class="fa-solid fa-gears"></i> Sync Engine Policies
+          </h3>
+          <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-6 text-xs">
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">Sync Direction</label>
+              <div class="space-y-1.5 pt-1.5">
+                <label class="flex items-center space-x-2 cursor-pointer">
+                  <input type="checkbox" id="cfg_sync_one_way_immich_master" checked class="rounded border-darkborder text-brand-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                  <span class="text-slate-200 font-semibold">One-Way (Immich Master)</span>
+                </label>
+                <label class="flex items-center space-x-2 cursor-pointer">
+                  <input type="checkbox" id="cfg_sync_ingest_from_icloud" class="rounded border-darkborder text-blue-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                  <span class="text-slate-300">Ingest from iCloud</span>
+                </label>
+              </div>
+              <span class="text-[11px] text-slate-500 mt-1 block">When One-Way is checked, photos are never imported from iCloud or Amazon into Immich.</span>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">Privacy & Exclusions</label>
+              <div class="space-y-1.5 pt-1.5">
+                <label class="flex items-center space-x-2 cursor-pointer select-none">
+                  <input type="checkbox" id="cfg_sync_ignore_hidden_locked" checked class="rounded border-darkborder text-amber-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                  <span class="text-slate-200 font-medium">Exclude Hidden / Locked</span>
+                </label>
+              </div>
+              <span class="text-[11px] text-slate-500 mt-1 block">Skips hidden, locked, archived, and private assets in Immich.</span>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">Enabled Image Hosts</label>
+              <div class="space-y-1.5 pt-1.5">
+                <label class="flex items-center space-x-2 cursor-pointer">
+                  <input type="checkbox" id="cfg_sync_enable_immich" checked class="rounded border-darkborder text-purple-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                  <span class="text-slate-200">Immich (Hub)</span>
+                </label>
+                <label class="flex items-center space-x-2 cursor-pointer">
+                  <input type="checkbox" id="cfg_sync_enable_icloud" checked class="rounded border-darkborder text-blue-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                  <span class="text-slate-200">iCloud Photos</span>
+                </label>
+                <label class="flex items-center space-x-2 cursor-pointer">
+                  <input type="checkbox" id="cfg_sync_enable_amazon" checked class="rounded border-darkborder text-amber-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                  <span class="text-slate-200">Amazon Photos</span>
+                </label>
+              </div>
+              <span class="text-[11px] text-slate-500 mt-1 block">Exclude any host temporarily from sync.</span>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">Max Delete Safety Threshold</label>
+              <input type="number" id="cfg_sync_max_deletes" value="50" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none">
+              <span class="text-[11px] text-slate-500 mt-1 block">Halts sync if deletions exceed this count in one cycle.</span>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">Daemon Polling Interval (seconds)</label>
+              <input type="number" id="cfg_sync_poll_interval" value="300" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none">
+              <span class="text-[11px] text-slate-500 mt-1 block">How frequently the continuous background worker runs.</span>
+            </div>
+            <div>
+              <label class="block text-slate-400 mb-1 font-medium">Temporary Download Directory</label>
+              <input type="text" id="cfg_sync_temp_dir" value="./.temp" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none font-mono">
+              <span class="text-[11px] text-slate-500 mt-1 block">Staging path for downloading & hashing in-flight files.</span>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+
+  <!-- 2FA VERIFICATION MODAL -->
+  <div id="modal2FA" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-darkcard border border-darkborder rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center space-x-3 text-blue-400">
+        <i class="fa-solid fa-shield-halved text-2xl"></i>
+        <div>
+          <h3 class="font-bold text-lg text-slate-100">iCloud 2FA Verification</h3>
+          <p class="text-xs text-slate-400">Enter the 6-digit code sent to your Apple devices</p>
+        </div>
+      </div>
+      <div id="modal2FAMessage" class="text-xs text-slate-300 bg-slate-900 p-3 rounded-lg border border-darkborder">
+        Initiating verification session with Apple...
+      </div>
+      <div>
+        <label class="block text-xs text-slate-400 mb-1">Verification Code</label>
+        <input type="text" id="input2FACode" placeholder="123456" maxlength="6" class="w-full bg-slate-900 border border-darkborder rounded-lg p-3 text-center text-2xl tracking-widest text-white font-mono focus:border-blue-500 focus:outline-none">
+      </div>
+      <div class="flex items-center justify-end space-x-3 pt-2">
+        <button onclick="close2FAModal()" class="px-4 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-slate-200">Cancel</button>
+        <button onclick="submit2FACode()" id="btnSubmit2FA" class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2 rounded-lg text-xs font-medium transition-colors">Verify & Trust</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 1-CLICK BOOKMARKLET MODAL -->
+  <div id="modalBookmarklet" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-darkcard border border-darkborder rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center space-x-3 text-amber-400">
+        <div class="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center text-lg">
+          <i class="fa-solid fa-bookmark"></i>
+        </div>
+        <div>
+          <h3 class="font-bold text-lg text-slate-100">1-Click Amazon Cookie Sync</h3>
+          <p class="text-xs text-slate-400">Sync cookies without opening F12 Developer Tools</p>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 p-4 rounded-xl border border-darkborder space-y-3.5 text-xs text-slate-300">
+        <div class="flex items-start space-x-2.5">
+          <span class="w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 font-bold flex items-center justify-center text-[11px] shrink-0 mt-0.5">1</span>
+          <span><strong>Drag this button</strong> to your browser's Bookmarks bar (Ctrl+Shift+B to show bookmarks bar):</span>
+        </div>
+        <div class="py-2 text-center">
+          <a id="modalBookmarkletLink" href="#" class="inline-flex items-center space-x-2 bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 hover:to-amber-400 text-slate-950 font-bold px-4 py-2.5 rounded-xl shadow-lg shadow-amber-500/20 cursor-grab active:cursor-grabbing select-none text-xs" onclick="event.preventDefault(); showToast('Drag this button to your Bookmarks Bar, or click Copy Code below!', 'success');">
+            <i class="fa-solid fa-bolt"></i>
+            <span>🔖 Sync Amazon Cookies</span>
+          </a>
+        </div>
+        <div class="flex items-start space-x-2.5">
+          <span class="w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 font-bold flex items-center justify-center text-[11px] shrink-0 mt-0.5">2</span>
+          <span>Visit <a href="https://www.amazon.ca/photos" target="_blank" class="text-amber-400 underline font-medium">https://www.amazon.ca/photos</a> while logged in.</span>
+        </div>
+        <div class="flex items-start space-x-2.5">
+          <span class="w-5 h-5 rounded-full bg-amber-500/20 text-amber-400 font-bold flex items-center justify-center text-[11px] shrink-0 mt-0.5">3</span>
+          <span><strong>Click the bookmark!</strong> It automatically grabs your session cookies and syncs them to this app.</span>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-between pt-2">
+        <button onclick="copyBookmarkletCode()" class="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-2 rounded-lg border border-darkborder font-medium flex items-center space-x-1.5">
+          <i class="fa-regular fa-copy"></i>
+          <span>Copy Bookmarklet Code</span>
+        </button>
+        <button onclick="closeBookmarkletModal()" class="bg-slate-800 hover:bg-slate-700 text-white px-5 py-2 rounded-lg text-xs font-medium transition-colors">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- AMAZON BROWSER LOGIN MODAL -->
+  <div id="modalAmazonLogin" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+    <div class="bg-darkcard border border-darkborder rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+      <div class="flex items-center space-x-3 text-amber-400">
+        <div class="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center text-lg">
+          <i class="fa-brands fa-amazon"></i>
+        </div>
+        <div>
+          <h3 class="font-bold text-lg text-slate-100">Amazon Photos Sign-In</h3>
+          <p class="text-xs text-slate-400">Automatic session cookie capture via dedicated browser</p>
+        </div>
+      </div>
+
+      <div class="bg-slate-900 p-4 rounded-xl border border-darkborder space-y-3.5 text-xs text-slate-300">
+        <p class="leading-relaxed">
+          Amazon protects authentication tokens with <code class="bg-slate-800 text-amber-300 px-1 py-0.5 rounded font-mono">HttpOnly</code>, which prevents bookmarklets or Javascript from reading them.
+        </p>
+        <p class="leading-relaxed text-slate-400">
+          Click <strong>"Open Sign-In Window"</strong> below to open Chrome. Simply log in to your Amazon account. Once logged in, the app automatically captures and saves your session tokens!
+        </p>
+
+        <div class="pt-1">
+          <label class="block text-xs text-slate-400 mb-1 font-medium">Amazon Region</label>
+          <select id="amazonLoginModalTld" class="w-full bg-slate-800 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-amber-500 focus:outline-none text-xs">
+            <option value="ca" selected>Canada (https://www.amazon.ca/photos)</option>
+            <option value="com">United States (https://www.amazon.com/photos)</option>
+            <option value="co.uk">United Kingdom (https://www.amazon.co.uk/photos)</option>
+            <option value="de">Germany (https://www.amazon.de/photos)</option>
+          </select>
+        </div>
+
+        <!-- Status display inside modal -->
+        <div id="amazonLoginStatusBox" class="p-3 rounded-lg border border-darkborder bg-slate-950/60 flex items-center space-x-3">
+          <div id="amazonLoginStatusIcon" class="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs shrink-0">
+            <i class="fa-solid fa-info"></i>
+          </div>
+          <div class="flex-1 truncate">
+            <span id="amazonLoginStatusText" class="text-xs text-slate-300">Ready to launch browser.</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="flex items-center justify-end space-x-3 pt-2">
+        <button onclick="closeAmazonLoginModal()" id="btnCancelAmazonLogin" class="px-4 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-slate-200">Close</button>
+        <button onclick="startAmazonBrowserLogin()" id="btnLaunchAmazonLogin" class="bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 text-slate-950 font-bold px-5 py-2.5 rounded-lg text-xs transition-all shadow-md shadow-amber-500/20 flex items-center space-x-1.5">
+          <i class="fa-solid fa-arrow-up-right-from-square text-xs"></i>
+          <span>Open Sign-In Window</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <!-- TOAST NOTIFICATION -->
+  <div id="toast" class="fixed bottom-5 right-5 bg-darkcard border border-brand-500/50 text-white px-4 py-3 rounded-xl shadow-2xl text-xs z-50 hidden flex items-center space-x-2">
+    <i id="toastIcon" class="fa-solid fa-circle-check text-brand-400"></i>
+    <span id="toastText">Action completed</span>
+  </div>
+
+  <!-- CLIENT-SIDE SCRIPT -->
+  <script>
+    let currentConfig = {};
+    let ws = null;
+    let daemonRunning = false;
+
+    // Tab Navigation
+    function switchTab(tabId) {
+      ['dashboard', 'albums', 'assets', 'settings'].forEach(id => {
+        document.getElementById(`tab-${id}`).classList.add('hidden');
+        document.getElementById(`tab-btn-${id}`).classList.remove('border-brand-500', 'text-brand-400');
+        document.getElementById(`tab-btn-${id}`).classList.add('border-transparent', 'text-slate-400');
+      });
+      document.getElementById(`tab-${tabId}`).classList.remove('hidden');
+      document.getElementById(`tab-btn-${tabId}`).classList.add('border-brand-500', 'text-brand-400');
+      document.getElementById(`tab-btn-${tabId}`).classList.remove('border-transparent', 'text-slate-400');
+
+      if (tabId === 'albums') fetchAlbums();
+      if (tabId === 'assets') fetchAssets();
+      if (tabId === 'settings') loadConfiguration();
+    }
+
+    // Global sync control states
+    let isSyncPaused = false;
+
+    // Status polling
+    async function updateStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const data = await res.json();
+
+        // Service Pills
+        renderServicePill('immich', data.services.immich);
+        renderServicePill('icloud', data.services.icloud);
+        renderServicePill('amazon', data.services.amazon);
+
+        // Syncing Badge & Active Action Controls
+        isSyncPaused = !!data.is_paused;
+        const syncBadge = document.getElementById('syncStatusBadge');
+        const syncBadgeIcon = document.getElementById('syncStatusIcon');
+        const syncBadgeText = document.getElementById('syncStatusText');
+        const syncActiveControls = document.getElementById('syncActiveControls');
+        const progressActionButtons = document.getElementById('progressActionButtons');
+        const syncBtn = document.getElementById('syncBtn');
+
+        const syncPauseIcon = document.getElementById('syncPauseIcon');
+        const syncPauseText = document.getElementById('syncPauseText');
+        const cardPauseIcon = document.getElementById('cardPauseIcon');
+        const cardPauseText = document.getElementById('cardPauseText');
+        const syncPauseBtn = document.getElementById('syncPauseBtn');
+        const cardPauseBtn = document.getElementById('cardPauseBtn');
+
+        if (data.is_syncing) {
+          syncBadge.classList.remove('hidden');
+          syncBadge.classList.add('flex');
+          if (syncActiveControls) {
+            syncActiveControls.classList.remove('hidden');
+            syncActiveControls.classList.add('flex');
+          }
+          if (progressActionButtons) {
+            progressActionButtons.classList.remove('hidden');
+            progressActionButtons.classList.add('flex');
+          }
+          syncBtn.disabled = true;
+          syncBtn.classList.add('opacity-50');
+
+          if (isSyncPaused) {
+            syncBadge.className = "flex items-center space-x-2 bg-amber-950/60 border border-amber-500/40 text-amber-300 text-xs px-3 py-1.5 rounded-full";
+            if (syncBadgeIcon) syncBadgeIcon.className = "fa-solid fa-pause text-xs";
+            if (syncBadgeText) syncBadgeText.innerText = "Sync Paused";
+
+            if (syncPauseIcon) syncPauseIcon.className = "fa-solid fa-play text-xs";
+            if (syncPauseText) syncPauseText.innerText = "Resume";
+            if (cardPauseIcon) cardPauseIcon.className = "fa-solid fa-play text-xs";
+            if (cardPauseText) cardPauseText.innerText = "Resume";
+
+            if (syncPauseBtn) syncPauseBtn.className = "flex items-center space-x-1.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 font-medium px-3 py-1.5 rounded-lg text-xs transition-all active:scale-95";
+            if (cardPauseBtn) cardPauseBtn.className = "flex items-center space-x-1.5 bg-emerald-500/10 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition-all active:scale-95";
+          } else {
+            syncBadge.className = "flex items-center space-x-2 bg-indigo-950/60 border border-indigo-500/40 text-indigo-300 text-xs px-3 py-1.5 rounded-full animate-pulse";
+            if (syncBadgeIcon) syncBadgeIcon.className = "fa-solid fa-arrows-rotate animate-spin text-xs";
+            if (syncBadgeText) syncBadgeText.innerText = "Syncing Active";
+
+            if (syncPauseIcon) syncPauseIcon.className = "fa-solid fa-pause text-xs";
+            if (syncPauseText) syncPauseText.innerText = "Pause";
+            if (cardPauseIcon) cardPauseIcon.className = "fa-solid fa-pause text-xs";
+            if (cardPauseText) cardPauseText.innerText = "Pause";
+
+            if (syncPauseBtn) syncPauseBtn.className = "flex items-center space-x-1.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 font-medium px-3 py-1.5 rounded-lg text-xs transition-all active:scale-95";
+            if (cardPauseBtn) cardPauseBtn.className = "flex items-center space-x-1.5 bg-amber-500/10 hover:bg-amber-500/25 text-amber-300 border border-amber-500/30 px-3 py-1.5 rounded-lg text-xs font-medium transition-all active:scale-95";
+          }
+        } else {
+          syncBadge.classList.add('hidden');
+          syncBadge.classList.remove('flex');
+          if (syncActiveControls) {
+            syncActiveControls.classList.add('hidden');
+            syncActiveControls.classList.remove('flex');
+          }
+          if (progressActionButtons) {
+            progressActionButtons.classList.add('hidden');
+            progressActionButtons.classList.remove('flex');
+          }
+          syncBtn.disabled = false;
+          syncBtn.classList.remove('opacity-50');
+        }
+
+        // Daemon Switch
+        daemonRunning = data.daemon_running;
+        const toggleBtn = document.getElementById('daemonToggleBtn');
+        const toggleCircle = document.getElementById('daemonToggleCircle');
+        const statusText = document.getElementById('daemonStatusText');
+        if (daemonRunning) {
+          toggleBtn.classList.remove('bg-slate-700');
+          toggleBtn.classList.add('bg-brand-600');
+          toggleCircle.classList.add('translate-x-6');
+          statusText.innerText = 'Active (Polling)';
+          statusText.classList.add('text-brand-400');
+        } else {
+          toggleBtn.classList.add('bg-slate-700');
+          toggleBtn.classList.remove('bg-brand-600');
+          toggleCircle.classList.remove('translate-x-6');
+          statusText.innerText = 'Stopped';
+          statusText.classList.remove('text-brand-400');
+        }
+
+        // Metrics
+        document.getElementById('statActiveAssets').innerText = data.db_stats.active_assets || 0;
+        if (data.last_stats) {
+          document.getElementById('statIcloudIngested').innerText = data.last_stats.icloud_ingested || 0;
+          document.getElementById('statImmichUploaded').innerText = data.last_stats.immich_uploaded || 0;
+          document.getElementById('statAmazonUploaded').innerText = data.last_stats.amazon_uploaded || 0;
+          document.getElementById('statIcloudUploaded').innerText = data.last_stats.icloud_uploaded || 0;
+          document.getElementById('statDeletionsSynced').innerText = data.last_stats.deletions_synced || 0;
+        }
+
+        // Live Progress & Mode Badges
+        if (data.progress) {
+          updateProgressUI(data.progress);
+        }
+        const oneWayBadge = document.getElementById('oneWayBadge');
+        if (oneWayBadge) {
+          if (data.one_way_immich_master !== false) {
+            oneWayBadge.classList.remove('hidden');
+            oneWayBadge.classList.add('flex');
+          } else {
+            oneWayBadge.classList.add('hidden');
+            oneWayBadge.classList.remove('flex');
+          }
+        }
+      } catch (err) {
+        console.error('Status fetch failed', err);
+      }
+    }
+
+    function renderServicePill(service, state) {
+      const pill = document.getElementById(`${service}StatusPill`);
+      const details = document.getElementById(`${service}Details`);
+      const capService = service.charAt(0).toUpperCase() + service.slice(1);
+      const hostToggle = document.getElementById(`hostToggle${capService}`);
+      const runToggle = document.getElementById(`runHost${capService}`);
+
+      if (state.enabled !== undefined) {
+        if (hostToggle) hostToggle.checked = state.enabled;
+        if (runToggle) runToggle.checked = state.enabled;
+      }
+
+      if (details && state.details) details.innerText = state.details;
+
+      if (state.enabled === false) {
+        pill.className = "text-xs px-2.5 py-1 rounded-full font-medium bg-slate-800 text-slate-400 border border-slate-700";
+        pill.innerText = "Disabled";
+      } else if (state.connected) {
+        pill.className = "text-xs px-2.5 py-1 rounded-full font-medium bg-emerald-950/80 text-emerald-400 border border-emerald-500/30";
+        pill.innerText = "Connected";
+      } else if (state.requires_2fa) {
+        pill.className = "text-xs px-2.5 py-1 rounded-full font-medium bg-amber-950/80 text-amber-400 border border-amber-500/30";
+        pill.innerText = "2FA Required";
+        document.getElementById('icloud2FABtn')?.classList.remove('hidden');
+      } else if (!state.configured) {
+        pill.className = "text-xs px-2.5 py-1 rounded-full font-medium bg-slate-800 text-slate-400 border border-slate-700";
+        pill.innerText = "Not Configured";
+      } else {
+        pill.className = "text-xs px-2.5 py-1 rounded-full font-medium bg-rose-950/80 text-rose-400 border border-rose-500/30";
+        pill.innerText = "Offline / Error";
+      }
+    }
+
+    async function toggleHostQuick(service, enabled) {
+      try {
+        const res = await fetch('/api/host/toggle', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ service: service, enabled: enabled })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message, 'success');
+          const capService = service.charAt(0).toUpperCase() + service.slice(1);
+          const runToggle = document.getElementById(`runHost${capService}`);
+          if (runToggle) runToggle.checked = enabled;
+          const cfgToggle = document.getElementById(`cfg_${service}_enabled`);
+          if (cfgToggle) cfgToggle.checked = enabled;
+          const syncCfgToggle = document.getElementById(`cfg_sync_enable_${service}`);
+          if (syncCfgToggle) syncCfgToggle.checked = enabled;
+          updateStatus();
+        } else {
+          showToast(data.detail || 'Failed to toggle host', 'error');
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    // Trigger Manual Sync
+    async function triggerSync() {
+      const dryRun = document.getElementById('optDryRun').checked;
+      const forceDeletes = document.getElementById('optForceDeletes').checked;
+      const enableImmich = document.getElementById('runHostImmich')?.checked ?? true;
+      const enableIcloud = document.getElementById('runHostIcloud')?.checked ?? true;
+      const enableAmazon = document.getElementById('runHostAmazon')?.checked ?? true;
+      try {
+        const res = await fetch('/api/sync/run', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            dry_run: dryRun,
+            force_deletes: forceDeletes,
+            enable_immich: enableImmich,
+            enable_icloud: enableIcloud,
+            enable_amazon: enableAmazon
+          })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(dryRun ? 'Started dry-run simulation' : 'Sync cycle started');
+          updateStatus();
+        } else {
+          showToast(data.detail || 'Sync failed to start', 'error');
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    // Toggle Pause / Resume Sync
+    async function togglePauseSync() {
+      const endpoint = isSyncPaused ? '/api/sync/resume' : '/api/sync/pause';
+      try {
+        const res = await fetch(endpoint, { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(data.message || (isSyncPaused ? 'Resuming sync cycle...' : 'Sync cycle paused.'));
+          updateStatus();
+        } else {
+          showToast(data.detail || data.message || 'Action failed', 'error');
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    // Stop Sync
+    async function stopSync() {
+      if (!confirm('Are you sure you want to stop the current sync cycle? Any progress up to this point is preserved.')) {
+        return;
+      }
+      try {
+        const res = await fetch('/api/sync/stop', { method: 'POST' });
+        const data = await res.json();
+        if (res.ok) {
+          showToast(data.message || 'Stopping sync cycle...');
+          updateStatus();
+        } else {
+          showToast(data.detail || data.message || 'Failed to stop sync', 'error');
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    // Toggle Daemon
+    async function toggleDaemon() {
+      const endpoint = daemonRunning ? '/api/sync/daemon/stop' : '/api/sync/daemon/start';
+      try {
+        await fetch(endpoint, { method: 'POST' });
+        showToast(daemonRunning ? 'Stopping daemon...' : 'Starting daemon...');
+        setTimeout(updateStatus, 800);
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    // Test specific service
+    async function testService(service) {
+      const capService = service.charAt(0).toUpperCase() + service.slice(1);
+      const btn = document.getElementById(`btnTest${capService}`);
+      const resultDiv = document.getElementById(`${service}TestResult`);
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> <span>Testing...</span>`;
+      }
+      if (resultDiv) {
+        resultDiv.className = "text-xs p-2.5 rounded-lg mt-2 font-medium bg-slate-800 border border-slate-700 text-slate-300 flex items-center gap-2";
+        resultDiv.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> <span>Testing connection to ${service}...</span>`;
+        resultDiv.classList.remove('hidden');
+      }
+
+      showToast(`Testing ${service}...`);
+
+      let payload = {};
+      if (service === 'immich') {
+        const urlEl = document.getElementById('cfg_immich_url');
+        const keyEl = document.getElementById('cfg_immich_api_key');
+        const sslEl = document.getElementById('cfg_immich_verify_ssl');
+        if (urlEl && urlEl.value.trim()) payload.url = urlEl.value.trim();
+        if (keyEl && keyEl.value.trim()) payload.api_key = keyEl.value.trim();
+        if (sslEl) payload.verify_ssl = sslEl.checked;
+      } else if (service === 'icloud') {
+        const appleIdEl = document.getElementById('cfg_icloud_apple_id');
+        const passEl = document.getElementById('cfg_icloud_password');
+        if (appleIdEl && appleIdEl.value.trim()) payload.apple_id = appleIdEl.value.trim();
+        if (passEl && passEl.value) payload.password = passEl.value;
+      } else if (service === 'amazon') {
+        const amzTld = document.getElementById('cfg_amazon_tld')?.value || 'ca';
+        const sId = document.getElementById('cfg_amazon_session_id')?.value.trim() || '';
+        const ubidVal = document.getElementById('cfg_amazon_ubid_main')?.value.trim() || '';
+        const atVal = document.getElementById('cfg_amazon_at_main')?.value.trim() || '';
+        payload.tld = amzTld;
+        payload.cookies = {
+          'session-id': sId,
+          'ubid-main': ubidVal,
+          'at-main': atVal
+        };
+        if (amzTld === 'ca') {
+          payload.cookies['ubid-acbca'] = ubidVal;
+          payload.cookies['at-acbca'] = atVal;
+        } else {
+          payload.cookies[`ubid-acb${amzTld}`] = ubidVal;
+          payload.cookies[`at-acb${amzTld}`] = atVal;
+        }
+      }
+
+      try {
+        const res = await fetch(`/api/test-connection/${service}`, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(`${service.toUpperCase()}: ${data.message}`, 'success');
+          if (resultDiv) {
+            resultDiv.className = "text-xs p-2.5 rounded-lg mt-2 font-medium bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 flex items-center gap-2";
+            resultDiv.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-400"></i> <span>${escapeHtml(data.message)}</span>`;
+          }
+        } else {
+          showToast(`${service.toUpperCase()}: ${data.message}`, 'error');
+          if (resultDiv) {
+            resultDiv.className = "text-xs p-2.5 rounded-lg mt-2 font-medium bg-rose-950/80 border border-rose-500/40 text-rose-300 flex items-center gap-2";
+            resultDiv.innerHTML = `<i class="fa-solid fa-triangle-exclamation text-rose-400"></i> <span>${escapeHtml(data.message)}</span>`;
+          }
+        }
+        updateStatus();
+      } catch (err) {
+        showToast(`Test failed: ${err.message}`, 'error');
+        if (resultDiv) {
+          resultDiv.className = "text-xs p-2.5 rounded-lg mt-2 font-medium bg-rose-950/80 border border-rose-500/40 text-rose-300 flex items-center gap-2";
+          resultDiv.innerHTML = `<i class="fa-solid fa-triangle-exclamation text-rose-400"></i> <span>Error: ${escapeHtml(err.message)}</span>`;
+        }
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = `<i class="fa-solid fa-bolt"></i> <span>${service === 'immich' ? 'Test Connection' : 'Test'}</span>`;
+        }
+      }
+    }
+
+    // 2FA Modal Handlers
+    async function open2FAModal() {
+      document.getElementById('modal2FA').classList.remove('hidden');
+      document.getElementById('modal2FAMessage').innerText = "Connecting to iCloud to request verification code...";
+      const payload = {};
+      const appleIdEl = document.getElementById('cfg_icloud_apple_id');
+      const passEl = document.getElementById('cfg_icloud_password');
+      if (appleIdEl && appleIdEl.value.trim()) payload.apple_id = appleIdEl.value.trim();
+      if (passEl && passEl.value) payload.password = passEl.value;
+      try {
+        const res = await fetch('/api/icloud/2fa/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          document.getElementById('modal2FAMessage').innerText = `Error: ${data.detail || data.message || 'Failed to start 2FA.'}`;
+          return;
+        }
+        document.getElementById('modal2FAMessage').innerText = data.message || "Enter 6-digit code:";
+      } catch (err) {
+        document.getElementById('modal2FAMessage').innerText = `Error: ${err.message}`;
+      }
+    }
+
+    function close2FAModal() {
+      document.getElementById('modal2FA').classList.add('hidden');
+      document.getElementById('input2FACode').value = '';
+    }
+
+    async function submit2FACode() {
+      const code = document.getElementById('input2FACode').value.trim();
+      if (code.length !== 6) {
+        alert("Please enter a valid 6-digit code.");
+        return;
+      }
+      try {
+        const res = await fetch('/api/icloud/2fa/verify', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ code })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message);
+          close2FAModal();
+          updateStatus();
+        } else {
+          alert(data.message || data.detail || "Verification failed");
+        }
+      } catch (err) {
+        alert("Verification error: " + err.message);
+      }
+    }
+
+    // Dynamic label updater for Amazon marketplace
+    function updateAmazonCookieLabels() {
+      const tld = document.getElementById('cfg_amazon_tld')?.value || 'ca';
+      const lblUbid = document.getElementById('lbl_amazon_ubid');
+      const lblAt = document.getElementById('lbl_amazon_at');
+      const hint = document.getElementById('amazonCookieHint');
+      const regionSpan = document.getElementById('amazonRegionLabel');
+
+      const ubidKey = tld === 'com' ? 'ubid-main' : `ubid-acb${tld}`;
+      const atKey = tld === 'com' ? 'at-main' : `at-acb${tld}`;
+
+      if (lblUbid) lblUbid.innerText = `${ubidKey} cookie (or ubid-main)`;
+      if (lblAt) lblAt.innerText = `${atKey} cookie (or at-main)`;
+      if (hint) hint.innerText = `From https://www.amazon.${tld}/photos F12`;
+      if (regionSpan) regionSpan.innerText = `amazon.${tld} (${tld === 'ca' ? 'Canada' : tld.toUpperCase()})`;
+    }
+
+    // Load & Save Configuration
+    async function loadConfiguration() {
+      try {
+        const res = await fetch('/api/config');
+        const cfg = await res.json();
+        currentConfig = cfg;
+
+        document.getElementById('cfg_immich_url').value = cfg.immich?.url || '';
+        document.getElementById('cfg_immich_api_key').value = cfg.immich?.api_key || '';
+        document.getElementById('cfg_immich_verify_ssl').checked = cfg.immich?.verify_ssl !== false;
+
+        document.getElementById('cfg_icloud_apple_id').value = cfg.icloud?.apple_id || '';
+        document.getElementById('cfg_icloud_password').value = cfg.icloud?.password || '';
+
+        const amzTld = cfg.amazon?.tld || 'ca';
+        const tldEl = document.getElementById('cfg_amazon_tld');
+        if (tldEl) tldEl.value = amzTld;
+
+        const amzCookies = cfg.amazon?.cookies || {};
+        document.getElementById('cfg_amazon_session_id').value = amzCookies['session-id'] || '';
+        document.getElementById('cfg_amazon_ubid_main').value = amzCookies[`ubid-acb${amzTld}`] || amzCookies['ubid-acbca'] || amzCookies['ubid-main'] || '';
+        document.getElementById('cfg_amazon_at_main').value = amzCookies[`at-acb${amzTld}`] || amzCookies['at-acbca'] || amzCookies['at-main'] || '';
+        updateAmazonCookieLabels();
+
+        const immichEn = cfg.immich?.enabled !== false && cfg.sync?.enable_immich !== false;
+        const icloudEn = cfg.icloud?.enabled !== false && cfg.sync?.enable_icloud !== false;
+        const amazonEn = cfg.amazon?.enabled !== false && cfg.sync?.enable_amazon !== false;
+
+        const immichCfgEl = document.getElementById('cfg_immich_enabled');
+        if (immichCfgEl) immichCfgEl.checked = immichEn;
+        const icloudCfgEl = document.getElementById('cfg_icloud_enabled');
+        if (icloudCfgEl) icloudCfgEl.checked = icloudEn;
+        const amazonCfgEl = document.getElementById('cfg_amazon_enabled');
+        if (amazonCfgEl) amazonCfgEl.checked = amazonEn;
+
+        const syncImmichEl = document.getElementById('cfg_sync_enable_immich');
+        if (syncImmichEl) syncImmichEl.checked = immichEn;
+        const syncIcloudEl = document.getElementById('cfg_sync_enable_icloud');
+        if (syncIcloudEl) syncIcloudEl.checked = icloudEn;
+        const syncAmazonEl = document.getElementById('cfg_sync_enable_amazon');
+        if (syncAmazonEl) syncAmazonEl.checked = amazonEn;
+
+        const runImmichEl = document.getElementById('runHostImmich');
+        if (runImmichEl) runImmichEl.checked = immichEn;
+        const runIcloudEl = document.getElementById('runHostIcloud');
+        if (runIcloudEl) runIcloudEl.checked = icloudEn;
+        const runAmazonEl = document.getElementById('runHostAmazon');
+        if (runAmazonEl) runAmazonEl.checked = amazonEn;
+
+        const oneWayEl = document.getElementById('cfg_sync_one_way_immich_master');
+        if (oneWayEl) oneWayEl.checked = cfg.sync?.one_way_immich_master !== false;
+        const ingestIcloudEl = document.getElementById('cfg_sync_ingest_from_icloud');
+        if (ingestIcloudEl) ingestIcloudEl.checked = cfg.sync?.ingest_from_icloud === true;
+
+        const uploadVideosEl = document.getElementById('cfg_amazon_upload_videos');
+        if (uploadVideosEl) uploadVideosEl.checked = cfg.amazon?.upload_videos === true;
+        const icloudUploadVideosEl = document.getElementById('cfg_icloud_upload_videos');
+        if (icloudUploadVideosEl) icloudUploadVideosEl.checked = cfg.icloud?.upload_videos !== false;
+        const ignoreHiddenEl = document.getElementById('cfg_sync_ignore_hidden_locked');
+        if (ignoreHiddenEl) ignoreHiddenEl.checked = cfg.sync?.ignore_hidden_and_locked !== false;
+
+        document.getElementById('cfg_sync_max_deletes').value = cfg.sync?.max_delete_limit || 50;
+        document.getElementById('cfg_sync_poll_interval').value = cfg.sync?.poll_interval_seconds || 300;
+        document.getElementById('cfg_sync_temp_dir').value = cfg.sync?.download_temp_dir || './.temp';
+      } catch (err) {
+        console.error('Failed to load config', err);
+      }
+    }
+
+    async function saveConfiguration() {
+      const saveBtn = document.getElementById('btnSaveConfig');
+      const saveResult = document.getElementById('saveConfigResult');
+      if (saveBtn) {
+        saveBtn.disabled = true;
+        saveBtn.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> <span>Saving...</span>`;
+      }
+
+      const maxDeletes = parseInt(document.getElementById('cfg_sync_max_deletes')?.value, 10);
+      const pollInterval = parseInt(document.getElementById('cfg_sync_poll_interval')?.value, 10);
+
+      const amazonTld = document.getElementById('cfg_amazon_tld')?.value || 'ca';
+      const amazonSessionId = document.getElementById('cfg_amazon_session_id')?.value.trim() || '';
+      const amazonUbid = document.getElementById('cfg_amazon_ubid_main')?.value.trim() || '';
+      const amazonAt = document.getElementById('cfg_amazon_at_main')?.value.trim() || '';
+
+      const immichEnabled = document.getElementById('cfg_immich_enabled')?.checked ?? document.getElementById('cfg_sync_enable_immich')?.checked ?? true;
+      const icloudEnabled = document.getElementById('cfg_icloud_enabled')?.checked ?? document.getElementById('cfg_sync_enable_icloud')?.checked ?? true;
+      const amazonEnabled = document.getElementById('cfg_amazon_enabled')?.checked ?? document.getElementById('cfg_sync_enable_amazon')?.checked ?? true;
+      const amazonUploadVideos = document.getElementById('cfg_amazon_upload_videos')?.checked ?? false;
+      const icloudUploadVideos = document.getElementById('cfg_icloud_upload_videos')?.checked ?? true;
+      const ignoreHiddenLocked = document.getElementById('cfg_sync_ignore_hidden_locked')?.checked ?? true;
+
+      const amazonCookies = {
+        'session-id': amazonSessionId,
+        'ubid-main': amazonUbid,
+        'at-main': amazonAt
+      };
+      if (amazonTld === 'ca') {
+        amazonCookies['ubid-acbca'] = amazonUbid;
+        amazonCookies['at-acbca'] = amazonAt;
+      } else {
+        amazonCookies[`ubid-acb${amazonTld}`] = amazonUbid;
+        amazonCookies[`at-acb${amazonTld}`] = amazonAt;
+      }
+
+      const payload = {
+        immich: {
+          url: document.getElementById('cfg_immich_url')?.value.trim() || "http://localhost:2283",
+          api_key: document.getElementById('cfg_immich_api_key')?.value.trim() || "",
+          verify_ssl: document.getElementById('cfg_immich_verify_ssl')?.checked ?? true,
+          enabled: immichEnabled
+        },
+        icloud: {
+          apple_id: document.getElementById('cfg_icloud_apple_id')?.value.trim() || "",
+          password: document.getElementById('cfg_icloud_password')?.value || null,
+          session_dir: currentConfig.icloud?.session_dir || './.icloud_session',
+          enabled: icloudEnabled,
+          upload_videos: icloudUploadVideos
+        },
+        amazon: {
+          cookies: amazonCookies,
+          tld: amazonTld,
+          enabled: amazonEnabled,
+          upload_videos: amazonUploadVideos
+        },
+        sync: {
+          one_way_immich_master: document.getElementById('cfg_sync_one_way_immich_master')?.checked ?? true,
+          ingest_from_icloud: document.getElementById('cfg_sync_ingest_from_icloud')?.checked ?? false,
+          ignore_hidden_and_locked: ignoreHiddenLocked,
+          sync_videos_to_amazon: amazonUploadVideos,
+          sync_videos_to_icloud: icloudUploadVideos,
+          sync_deletions: true,
+          sync_albums: true,
+          max_delete_limit: isNaN(maxDeletes) ? 50 : maxDeletes,
+          download_temp_dir: document.getElementById('cfg_sync_temp_dir')?.value.trim() || './.temp',
+          poll_interval_seconds: isNaN(pollInterval) ? 300 : pollInterval,
+          dry_run: false,
+          enable_immich: immichEnabled,
+          enable_icloud: icloudEnabled,
+          enable_amazon: amazonEnabled
+        }
+      };
+
+      try {
+        const res = await fetch('/api/config', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload)
+        });
+        if (res.ok) {
+          showToast('Configuration saved successfully!', 'success');
+          if (saveResult) {
+            saveResult.className = "text-xs font-semibold px-3 py-1.5 rounded-lg bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 flex items-center gap-1.5";
+            saveResult.innerHTML = `<i class="fa-solid fa-check"></i> <span>Saved to config.json!</span>`;
+            saveResult.classList.remove('hidden');
+            setTimeout(() => saveResult.classList.add('hidden'), 4000);
+          }
+          updateStatus();
+        } else {
+          const err = await res.json();
+          const detail = typeof err.detail === 'string' ? err.detail : JSON.stringify(err.detail);
+          showToast(detail || 'Failed to save config', 'error');
+          if (saveResult) {
+            saveResult.className = "text-xs font-semibold px-3 py-1.5 rounded-lg bg-rose-950/80 border border-rose-500/40 text-rose-300 flex items-center gap-1.5";
+            saveResult.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i> <span>${escapeHtml(detail)}</span>`;
+            saveResult.classList.remove('hidden');
+          }
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      } finally {
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.innerHTML = `<i class="fa-solid fa-floppy-disk text-xs"></i> <span>Save Settings</span>`;
+        }
+      }
+    }
+
+    // Fetch Albums
+    async function fetchAlbums() {
+      const container = document.getElementById('albumsContainer');
+      container.innerHTML = `<div class="text-slate-400 text-sm italic col-span-3 text-center py-12">Loading albums...</div>`;
+      try {
+        const res = await fetch('/api/albums');
+        const data = await res.json();
+        if (!data.items || data.items.length === 0) {
+          container.innerHTML = `
+            <div class="col-span-3 bg-darkcard border border-darkborder rounded-2xl p-8 text-center space-y-3">
+              <i class="fa-regular fa-images text-slate-500 text-4xl"></i>
+              <h4 class="font-semibold text-slate-200">No Albums Synchronized Yet</h4>
+              <p class="text-xs text-slate-400 max-w-sm mx-auto">When albums are detected in Immich, they will appear here with mappings to Amazon Photos and iCloud.</p>
+            </div>
+          `;
+          return;
+        }
+
+        container.innerHTML = data.items.map(a => `
+          <div class="bg-darkcard border border-darkborder rounded-2xl p-5 space-y-3">
+            <div class="flex items-center justify-between">
+              <h4 class="font-bold text-slate-100 flex items-center gap-2">
+                <i class="fa-solid fa-folder text-brand-400"></i> ${escapeHtml(a.name || 'Unnamed')}
+              </h4>
+              <span class="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">Tracked</span>
+            </div>
+            <div class="space-y-1.5 text-xs font-mono text-slate-400 pt-2 border-t border-darkborder/60">
+              <div class="flex justify-between truncate"><span>Immich ID:</span> <span class="text-slate-300">${a.immich_id ? a.immich_id.substring(0, 16) + '...' : '-'}</span></div>
+              <div class="flex justify-between truncate"><span>Amazon ID:</span> <span class="text-amber-400">${a.amazon_id ? a.amazon_id.substring(0, 16) + '...' : '-'}</span></div>
+              <div class="flex justify-between truncate"><span>iCloud ID:</span> <span class="text-blue-400">${a.icloud_id || '-'}</span></div>
+            </div>
+            <div class="text-[10px] text-slate-500 pt-1">Synced: ${a.last_synced_at || '-'}</div>
+          </div>
+        `).join('');
+      } catch (err) {
+        container.innerHTML = `<div class="text-red-400 text-sm col-span-3 text-center py-12">${err.message}</div>`;
+      }
+    }
+
+    // Fetch Assets
+    async function fetchAssets() {
+      const q = document.getElementById('assetSearchInput')?.value || '';
+      const tbody = document.getElementById('assetsTableBody');
+      try {
+        const res = await fetch(`/api/assets?limit=50&search=${encodeURIComponent(q)}`);
+        const data = await res.json();
+        if (!data.items || data.items.length === 0) {
+          tbody.innerHTML = `<tr><td colspan="7" class="p-8 text-center text-slate-500 font-sans italic">No tracked assets found. Run a sync cycle to ingest media.</td></tr>`;
+          return;
+        }
+
+        tbody.innerHTML = data.items.map(a => `
+          <tr class="hover:bg-slate-800/40 transition-colors">
+            <td class="p-3.5 font-sans font-medium text-slate-200 truncate max-w-xs">${escapeHtml(a.filename || 'asset.jpg')}</td>
+            <td class="p-3.5">
+              <span class="px-2 py-0.5 rounded text-[10px] ${a.status === 'ACTIVE' ? 'bg-emerald-950 text-emerald-400 border border-emerald-500/30' : 'bg-red-950 text-red-400 border border-red-500/30'}">
+                ${a.status}
+              </span>
+            </td>
+            <td class="p-3.5 text-slate-400 text-[11px]">${(a.sha1 || '').substring(0, 8)}... / ${(a.md5 || '').substring(0, 8)}...</td>
+            <td class="p-3.5 text-purple-400 text-[11px] truncate max-w-[120px]">${a.immich_id ? a.immich_id.substring(0, 8) + '...' : '-'}</td>
+            <td class="p-3.5 text-amber-400 text-[11px] truncate max-w-[120px]">${a.amazon_id ? a.amazon_id.substring(0, 8) + '...' : '-'}</td>
+            <td class="p-3.5 text-blue-400 text-[11px] truncate max-w-[120px]">${a.icloud_id ? a.icloud_id.substring(0, 8) + '...' : '-'}</td>
+            <td class="p-3.5 text-slate-500 text-[11px]">${(a.last_synced_at || '').substring(0, 16)}</td>
+          </tr>
+        `).join('');
+      } catch (err) {
+        tbody.innerHTML = `<tr><td colspan="7" class="p-8 text-center text-red-400">${err.message}</td></tr>`;
+      }
+    }
+
+    let searchTimer = null;
+    function searchAssets() {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(fetchAssets, 300);
+    }
+
+    // Live Progress Bar & Percentage Updates
+    function updateProgressUI(p) {
+      if (!p) return;
+      const card = document.getElementById('syncProgressCard');
+      const bar = document.getElementById('progressBarFill');
+      const shimmer = document.getElementById('progressBarShimmer');
+      const pctLabel = document.getElementById('progressPercentLabel');
+      const title = document.getElementById('progressPhaseTitle');
+      const badge = document.getElementById('progressPhaseBadge');
+      const desc = document.getElementById('progressActionDesc');
+      const counts = document.getElementById('progressCountsLabel');
+      const icon = document.getElementById('progressStatusIcon');
+
+      const pct = Math.max(0, Math.min(100, Math.round(p.percent || 0)));
+      if (bar) bar.style.width = `${pct}%`;
+      if (pctLabel) pctLabel.innerText = `${pct}%`;
+      if (title && p.phase_name) title.innerText = p.phase_name;
+      if (badge && p.phase) badge.innerText = p.phase.toUpperCase();
+      if (desc && p.action) desc.innerText = p.action;
+
+      if (counts) {
+        if (p.total > 0) {
+          counts.innerText = `${p.current} / ${p.total} items`;
+        } else if (p.active) {
+          counts.innerText = 'Working...';
+        } else if (pct === 100) {
+          counts.innerText = 'Complete';
+        } else {
+          counts.innerText = 'Ready';
+        }
+      }
+
+      if (p.phase === 'paused') {
+        if (shimmer) shimmer.classList.add('hidden');
+        if (card) card.className = "bg-darkcard border border-amber-500/50 rounded-2xl p-5 shadow-lg shadow-amber-500/10 space-y-3 transition-all duration-300";
+        if (badge) {
+          badge.className = "text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40";
+          badge.innerText = "PAUSED";
+        }
+        if (icon) {
+          icon.className = "w-9 h-9 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center text-sm border border-amber-500/30";
+          icon.innerHTML = '<i class="fa-solid fa-pause"></i>';
+        }
+        if (counts) {
+          if (p.total > 0) counts.innerText = `${p.current} / ${p.total} (Paused)`;
+          else counts.innerText = 'Paused';
+        }
+      } else if (p.phase === 'stopping') {
+        if (shimmer) shimmer.classList.add('hidden');
+        if (card) card.className = "bg-darkcard border border-rose-500/50 rounded-2xl p-5 shadow-lg shadow-rose-500/10 space-y-3 transition-all duration-300";
+        if (badge) {
+          badge.className = "text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-rose-500/20 text-rose-300 border border-rose-500/40 animate-pulse";
+          badge.innerText = "STOPPING";
+        }
+        if (icon) {
+          icon.className = "w-9 h-9 rounded-xl bg-rose-500/20 text-rose-400 flex items-center justify-center text-sm border border-rose-500/30";
+          icon.innerHTML = '<i class="fa-solid fa-stop text-xs"></i>';
+        }
+        if (counts) counts.innerText = 'Stopping...';
+      } else if (p.active) {
+        if (shimmer) shimmer.classList.remove('hidden');
+        if (card) card.className = "bg-darkcard border border-brand-500/50 rounded-2xl p-5 shadow-lg shadow-brand-500/10 space-y-3 transition-all duration-300";
+        if (badge) badge.className = "text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-brand-500/20 text-brand-300 border border-brand-500/40 animate-pulse";
+        if (icon) {
+          icon.className = "w-9 h-9 rounded-xl bg-brand-500/20 text-brand-400 flex items-center justify-center text-sm border border-brand-500/30";
+          icon.innerHTML = '<i class="fa-solid fa-arrows-rotate animate-spin"></i>';
+        }
+      } else {
+        if (shimmer) shimmer.classList.add('hidden');
+        if (card) card.className = "bg-darkcard border border-darkborder rounded-2xl p-5 shadow-lg space-y-3 transition-all duration-300";
+        if (badge) badge.className = "text-[10px] uppercase font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700";
+        if (icon) {
+          if (pct === 100) {
+            icon.className = "w-9 h-9 rounded-xl bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-sm border border-emerald-500/30";
+            icon.innerHTML = '<i class="fa-solid fa-check"></i>';
+          } else {
+            icon.className = "w-9 h-9 rounded-xl bg-slate-800 text-slate-400 flex items-center justify-center text-sm border border-darkborder/70";
+            icon.innerHTML = '<i class="fa-solid fa-cloud-arrow-up"></i>';
+          }
+        }
+      }
+    }
+
+    // WebSocket Log Streaming
+    function initWebSocket() {
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${protocol}//${window.location.host}/ws/logs`);
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'progress' && msg.data) {
+          updateProgressUI(msg.data);
+        } else {
+          appendTerminalLog(msg);
+        }
+      };
+
+      ws.onclose = () => {
+        setTimeout(initWebSocket, 2500); // Reconnect
+      };
+    }
+
+    function appendTerminalLog(log) {
+      const term = document.getElementById('terminal');
+      if (term.innerText.includes('[Waiting for log events...]')) {
+        term.innerHTML = '';
+      }
+
+      let colorClass = "text-slate-300";
+      if (log.level === 'ERROR') colorClass = "text-rose-400 font-semibold";
+      else if (log.level === 'WARNING') colorClass = "text-amber-300";
+      else if (log.message.includes('Uploaded') || log.message.includes('Created album') || log.message.includes('Summary')) colorClass = "text-emerald-400";
+      else if (log.message.includes('DRY RUN')) colorClass = "text-sky-300";
+
+      const line = document.createElement('div');
+      line.className = "leading-relaxed";
+      line.innerHTML = `<span class="text-slate-600 select-none">${log.timestamp}</span> <span class="text-slate-500 text-[10px] select-none">[${log.level}]</span> <span class="${colorClass}">${escapeHtml(log.message)}</span>`;
+      term.appendChild(line);
+
+      if (document.getElementById('autoScrollCheck').checked) {
+        term.scrollTop = term.scrollHeight;
+      }
+    }
+
+    function clearTerminal() {
+      document.getElementById('terminal').innerHTML = '<div class="text-slate-500 italic">[Waiting for log events...]</div>';
+    }
+
+    let toastTimer = null;
+    function showToast(message, type = 'success') {
+      const toast = document.getElementById('toast');
+      const text = document.getElementById('toastText');
+      const icon = document.getElementById('toastIcon');
+
+      text.innerText = message;
+      if (type === 'error') {
+        icon.className = "fa-solid fa-triangle-exclamation text-rose-400 text-sm";
+        toast.className = "fixed bottom-5 right-5 bg-darkcard border border-rose-500/60 text-slate-100 px-4 py-3 rounded-xl shadow-2xl text-xs z-50 flex items-center space-x-2";
+      } else {
+        icon.className = "fa-solid fa-circle-check text-emerald-400 text-sm";
+        toast.className = "fixed bottom-5 right-5 bg-darkcard border border-emerald-500/60 text-slate-100 px-4 py-3 rounded-xl shadow-2xl text-xs z-50 flex items-center space-x-2";
+      }
+
+      toast.classList.remove('hidden');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => {
+        toast.classList.add('hidden');
+      }, 5000);
+    }
+
+    function escapeHtml(text) {
+      if (!text) return '';
+      return text.replace(/[&<>"']/g, function(m) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m];
+      });
+    }
+
+    // 1-Click Amazon Bookmarklet Functions
+    function getBookmarkletCode() {
+      return `javascript:(function(){function g(n){var v='; '+document.cookie;var p=v.split('; '+n+'=');if(p.length===2)return p.pop().split(';').shift();return null;}var h=window.location.hostname;var t='ca';if(h.endsWith('.com'))t='com';else if(h.endsWith('.co.uk'))t='co.uk';else if(h.endsWith('.de'))t='de';var s=g('session-id');var u=g('ubid-acb'+t)||g('ubid-main')||g('ubid');var a=g('at-acb'+t)||g('at-main')||g('at');if(!s){alert('Please log in to Amazon Photos first!');return;}var pld={tld:t,cookies:{'session-id':s,['ubid-acb'+t]:u||'',['ubid-main']:u||'',['at-acb'+t]:a||'',['at-main']:a||''}};fetch('http://127.0.0.1:5050/api/amazon/cookies',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(pld)}).then(function(r){return r.json();}).then(function(d){alert(d.message||'Amazon cookies synced successfully!');}).catch(function(){window.open('http://127.0.0.1:5050/api/amazon/cookie-import?data='+encodeURIComponent(JSON.stringify(pld)),'_blank');});})();`;
+    }
+
+    function initBookmarklet() {
+      const code = getBookmarkletCode();
+      const link1 = document.getElementById('amazonBookmarkletLink');
+      if (link1) link1.href = code;
+      const link2 = document.getElementById('modalBookmarkletLink');
+      if (link2) link2.href = code;
+    }
+
+    function openBookmarkletModal() {
+      document.getElementById('modalBookmarklet')?.classList.remove('hidden');
+    }
+
+    function closeBookmarkletModal() {
+      document.getElementById('modalBookmarklet')?.classList.add('hidden');
+    }
+
+    function copyBookmarkletCode() {
+      const code = getBookmarkletCode();
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(code).then(() => {
+          showToast('Bookmarklet code copied to clipboard!', 'success');
+        }).catch(() => {
+          prompt('Copy this bookmarklet code:', code);
+        });
+      } else {
+        prompt('Copy this bookmarklet code:', code);
+      }
+    }
+
+    // Automated Amazon Browser Login Functions
+    let amazonLoginPoller = null;
+
+    function openAmazonLoginModal() {
+      const tld = document.getElementById('cfg_amazon_tld')?.value || 'ca';
+      const modalTld = document.getElementById('amazonLoginModalTld');
+      if (modalTld) modalTld.value = tld;
+
+      const statusBox = document.getElementById('amazonLoginStatusBox');
+      const statusIcon = document.getElementById('amazonLoginStatusIcon');
+      const statusText = document.getElementById('amazonLoginStatusText');
+      const launchBtn = document.getElementById('btnLaunchAmazonLogin');
+
+      if (statusBox) statusBox.className = "p-3 rounded-lg border border-darkborder bg-slate-950/60 flex items-center space-x-3";
+      if (statusIcon) {
+        statusIcon.className = "w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs shrink-0";
+        statusIcon.innerHTML = '<i class="fa-solid fa-info"></i>';
+      }
+      if (statusText) statusText.innerText = "Ready to launch browser.";
+      if (launchBtn) {
+        launchBtn.disabled = false;
+        launchBtn.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square text-xs"></i> <span>Open Sign-In Window</span>';
+      }
+
+      document.getElementById('modalAmazonLogin')?.classList.remove('hidden');
+    }
+
+    function closeAmazonLoginModal() {
+      if (amazonLoginPoller) {
+        clearInterval(amazonLoginPoller);
+        amazonLoginPoller = null;
+      }
+      fetch('/api/amazon/login/cancel', { method: 'POST' }).catch(() => {});
+      document.getElementById('modalAmazonLogin')?.classList.add('hidden');
+    }
+
+    async function startAmazonBrowserLogin() {
+      const tld = document.getElementById('amazonLoginModalTld')?.value || 'ca';
+      const launchBtn = document.getElementById('btnLaunchAmazonLogin');
+      const statusBox = document.getElementById('amazonLoginStatusBox');
+      const statusIcon = document.getElementById('amazonLoginStatusIcon');
+      const statusText = document.getElementById('amazonLoginStatusText');
+
+      if (launchBtn) {
+        launchBtn.disabled = true;
+        launchBtn.innerHTML = '<i class="fa-solid fa-spinner animate-spin text-xs"></i> <span>Browser Active...</span>';
+      }
+      if (statusBox) statusBox.className = "p-3 rounded-lg border border-amber-500/40 bg-amber-950/20 flex items-center space-x-3";
+      if (statusIcon) {
+        statusIcon.className = "w-7 h-7 rounded-full bg-amber-500/20 text-amber-400 flex items-center justify-center text-xs shrink-0";
+        statusIcon.innerHTML = '<i class="fa-solid fa-spinner animate-spin"></i>';
+      }
+      if (statusText) statusText.innerText = "Launching Chrome window... Please wait.";
+
+      try {
+        const res = await fetch('/api/amazon/login/start', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ tld: tld })
+        });
+        const data = await res.json();
+
+        if (amazonLoginPoller) clearInterval(amazonLoginPoller);
+        amazonLoginPoller = setInterval(pollAmazonLoginStatus, 1200);
+      } catch (err) {
+        if (statusBox) statusBox.className = "p-3 rounded-lg border border-rose-500/40 bg-rose-950/20 flex items-center space-x-3";
+        if (statusIcon) {
+          statusIcon.className = "w-7 h-7 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center text-xs shrink-0";
+          statusIcon.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i>';
+        }
+        if (statusText) statusText.innerText = `Error: ${err.message}`;
+        if (launchBtn) {
+          launchBtn.disabled = false;
+          launchBtn.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square text-xs"></i> <span>Retry</span>';
+        }
+      }
+    }
+
+    async function pollAmazonLoginStatus() {
+      try {
+        const res = await fetch('/api/amazon/login/status');
+        const data = await res.json();
+
+        const statusBox = document.getElementById('amazonLoginStatusBox');
+        const statusIcon = document.getElementById('amazonLoginStatusIcon');
+        const statusText = document.getElementById('amazonLoginStatusText');
+        const launchBtn = document.getElementById('btnLaunchAmazonLogin');
+
+        if (statusText && data.message) statusText.innerText = data.message;
+
+        if (data.state === 'success') {
+          if (amazonLoginPoller) {
+            clearInterval(amazonLoginPoller);
+            amazonLoginPoller = null;
+          }
+          if (statusBox) statusBox.className = "p-3 rounded-lg border border-emerald-500/40 bg-emerald-950/20 flex items-center space-x-3";
+          if (statusIcon) {
+            statusIcon.className = "w-7 h-7 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-xs shrink-0";
+            statusIcon.innerHTML = '<i class="fa-solid fa-check"></i>';
+          }
+          showToast('Amazon Photos connected successfully!', 'success');
+          updateStatus();
+          loadConfiguration();
+          setTimeout(closeAmazonLoginModal, 2200);
+        } else if (data.state === 'error' || data.state === 'cancelled') {
+          if (amazonLoginPoller) {
+            clearInterval(amazonLoginPoller);
+            amazonLoginPoller = null;
+          }
+          if (statusBox) statusBox.className = "p-3 rounded-lg border border-rose-500/40 bg-rose-950/20 flex items-center space-x-3";
+          if (statusIcon) {
+            statusIcon.className = "w-7 h-7 rounded-full bg-rose-500/20 text-rose-400 flex items-center justify-center text-xs shrink-0";
+            statusIcon.innerHTML = '<i class="fa-solid fa-triangle-exclamation"></i>';
+          }
+          if (launchBtn) {
+            launchBtn.disabled = false;
+            launchBtn.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square text-xs"></i> <span>Try Again</span>';
+          }
+        }
+      } catch (err) {
+        console.error('Error polling login status', err);
+      }
+    }
+
+    // Initialization
+    window.addEventListener('DOMContentLoaded', () => {
+      initWebSocket();
+      initBookmarklet();
+      updateStatus();
+      loadConfiguration();
+      setInterval(updateStatus, 3000);
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,39 @@
+{
+  "immich": {
+    "url": "https://immich.yourdomain.com",
+    "api_key": "YOUR_IMMICH_API_KEY",
+    "verify_ssl": true,
+    "enabled": true
+  },
+  "icloud": {
+    "apple_id": "your_apple_id@icloud.com",
+    "password": "YOUR_APPLE_ID_PASSWORD",
+    "session_dir": "./.icloud_session",
+    "enabled": true
+  },
+  "amazon": {
+    "cookies": {
+      "session-id": "YOUR_AMAZON_SESSION_ID",
+      "ubid-acbca": "YOUR_AMAZON_UBID_ACBCA",
+      "at-acbca": "YOUR_AMAZON_AT_ACBCA"
+    },
+    "tld": "ca",
+    "enabled": true,
+    "upload_videos": false
+  },
+  "sync": {
+    "sync_deletions": true,
+    "sync_albums": true,
+    "ignore_hidden_and_locked": true,
+    "sync_videos_to_amazon": false,
+    "max_delete_limit": 50,
+    "download_temp_dir": "./.temp",
+    "poll_interval_seconds": 300,
+    "dry_run": false,
+    "enable_immich": true,
+    "enable_icloud": true,
+    "enable_amazon": true,
+    "one_way_immich_master": true,
+    "ingest_from_icloud": false
+  }
+}
