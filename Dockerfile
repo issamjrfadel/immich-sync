@@ -15,6 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     tzdata \
+    libatomic1 \
     xvfb \
     x11vnc \
     novnc \
