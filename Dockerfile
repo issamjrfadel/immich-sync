@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
@@ -19,13 +19,37 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11vnc \
     novnc \
     websockify \
+    fonts-liberation \
+    fonts-freefont-ttf \
+    libfontconfig1 \
+    libfreetype6 \
+    libasound2 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libgbm1 \
+    libglib2.0-0 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libx11-6 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
     && ln -sf /usr/share/novnc/vnc.html /usr/share/novnc/index.html \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install --with-deps chromium \
-    && rm -rf /var/lib/apt/lists/*
+    && python -m playwright install chromium
 
 COPY app.py sync.py config.example.json docker-entrypoint.sh ./
 COPY src/ ./src/
