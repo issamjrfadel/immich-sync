@@ -499,6 +499,9 @@ class SyncEngine:
                     except OSError:
                         pass
 
+        if self.stop_event and self.stop_event.is_set():
+            return count
+
         self.report_progress(70, "immich_sync", "Photo Mirroring Complete", total_items, total_items, "", f"Mirrored {count} assets from Immich.")
         return count
 
@@ -522,6 +525,8 @@ class SyncEngine:
         if self.is_amazon_enabled and not sync_videos_to_amz:
             for a in tracked_active:
                 fn = a.get("filename") or ""
+                if self.check_pause_and_stop(fn, 70, 0, len(tracked_active)):
+                    return 0
                 amz_id = a.get("amazon_id")
                 if amz_id and amz_id != "CONFLICT_EXISTING" and not amz_id.startswith("dry_run") and is_video_file(fn):
                     logger.info(f"Purging video '{fn}' from Amazon Photos (video sync disabled)...")
@@ -621,6 +626,9 @@ class SyncEngine:
                 else:
                     logger.warning(f"Deletion of '{filename}' deferred: target service failed (Amazon OK: {amazon_ok}, iCloud OK: {icloud_ok}).")
 
+        if self.stop_event and self.stop_event.is_set():
+            return synced_count
+
         self.report_progress(90, "deletions", "Deletions Synced", num_deletions, num_deletions, "", f"Propagated {synced_count} deletions from Immich.")
         return synced_count
 
@@ -703,6 +711,8 @@ class SyncEngine:
                         if icloud_album:
                             logger.info(f"  -> Created/Verified album '{album_name}' in iCloud Photos.")
                             for aid in asset_ids:
+                                if self.stop_event and self.stop_event.is_set():
+                                    break
                                 record = self.db.get_asset_by_immich_id(aid)
                                 if record and record.get("icloud_id"):
                                     photo = self.icloud.find_photo_by_id(record["icloud_id"])

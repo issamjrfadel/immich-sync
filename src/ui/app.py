@@ -682,22 +682,46 @@ def create_app(
         sync_state["daemon_running"] = True
 
         def daemon_worker():
-            interval = cfg.sync.poll_interval_seconds
-            logger.info(f"Sync daemon started (polling every {interval}s)")
-            engine = SyncEngine(cfg, db_path=db_path, progress_callback=handle_sync_progress)
+            logger.info(f"Sync daemon started (polling every {cfg.sync.poll_interval_seconds}s)")
 
             while not sync_state["stop_daemon_event"].is_set():
+                active_cfg = get_cfg() or cfg
+                interval = active_cfg.sync.poll_interval_seconds
+
                 if not sync_state["is_syncing"]:
                     sync_state["is_syncing"] = True
+                    sync_state["is_paused"] = False
+                    sync_state["stop_sync_event"].clear()
+                    sync_state["pause_sync_event"].clear()
                     try:
+                        engine = SyncEngine(
+                            active_cfg,
+                            db_path=db_path,
+                            progress_callback=handle_sync_progress,
+                            stop_event=sync_state["stop_sync_event"],
+                            pause_event=sync_state["pause_sync_event"],
+                        )
                         stats = engine.run_sync_cycle()
                         sync_state["last_stats"] = stats
                         sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
                     except Exception as e:
                         logger.error(f"Daemon cycle error: {e}")
                     finally:
+                        was_stopped = sync_state["stop_sync_event"].is_set()
                         sync_state["is_syncing"] = False
+                        sync_state["is_paused"] = False
+                        sync_state["stop_sync_event"].clear()
+                        sync_state["pause_sync_event"].clear()
                         sync_progress["active"] = False
+                        if was_stopped:
+                            sync_progress["phase"] = "stopped"
+                            sync_progress["phase_name"] = "Sync Stopped"
+                            sync_progress["action"] = "Sync cycle was stopped by user."
+                            if log_broadcaster._loop and log_broadcaster.active_connections:
+                                asyncio.run_coroutine_threadsafe(
+                                    log_broadcaster.broadcast({"type": "progress", "data": sync_progress}),
+                                    log_broadcaster._loop,
+                                )
 
                 # Sleep in short increments to respond quickly to stop requests
                 for _ in range(interval):
@@ -728,6 +752,10 @@ def create_app(
             return {"status": "not_running"}
 
         sync_state["stop_daemon_event"].set()
+        if sync_state["is_syncing"]:
+            sync_state["stop_sync_event"].set()
+            sync_state["pause_sync_event"].clear()
+            sync_state["is_paused"] = False
         return {"status": "stopping"}
 
     @app.get("/api/assets")

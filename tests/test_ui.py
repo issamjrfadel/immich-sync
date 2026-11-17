@@ -290,6 +290,74 @@ class TestUIDashboard(unittest.TestCase):
         self.assertEqual(auth_client.get("/", auth=("admin", "wrong")).status_code, 401)
         self.assertEqual(auth_client.get("/", auth=("admin", "secret123")).status_code, 200)
 
+    def test_daemon_sync_respects_pause_and_stop_events(self):
+        import threading
+        import time
+        from unittest.mock import patch
+        from src.ui.app import sync_state
+
+        created_engines = []
+        cycle_entered = threading.Event()
+        cycle_release = threading.Event()
+
+        class FakeEngine:
+            def __init__(self, config, db_path="sync_state.db", progress_callback=None, stop_event=None, pause_event=None):
+                self.stop_event = stop_event
+                self.pause_event = pause_event
+                created_engines.append(self)
+
+            def run_sync_cycle(self):
+                cycle_entered.set()
+                cycle_release.wait(timeout=3.0)
+                return {"immich_direct_synced": 0, "deletions_synced": 0, "albums_synced": 0}
+
+        try:
+            with patch("src.ui.app.SyncEngine", FakeEngine):
+                resp = self.client.post("/api/sync/daemon/start")
+                self.assertEqual(resp.status_code, 200)
+                self.assertTrue(cycle_entered.wait(timeout=3.0))
+
+                self.assertEqual(len(created_engines), 1)
+                self.assertIs(created_engines[0].stop_event, sync_state["stop_sync_event"])
+                self.assertIs(created_engines[0].pause_event, sync_state["pause_sync_event"])
+
+                # Pause & resume while daemon cycle is active
+                pause_resp = self.client.post("/api/sync/pause")
+                self.assertEqual(pause_resp.json()["status"], "paused")
+                self.assertTrue(created_engines[0].pause_event.is_set())
+
+                stop_resp = self.client.post("/api/sync/stop")
+                self.assertEqual(stop_resp.json()["status"], "stopping")
+                self.assertTrue(created_engines[0].stop_event.is_set())
+                self.assertFalse(created_engines[0].pause_event.is_set())
+        finally:
+            cycle_release.set()
+            self.client.post("/api/sync/daemon/stop")
+            if sync_state.get("daemon_thread"):
+                sync_state["daemon_thread"].join(timeout=3.0)
+            sync_state["daemon_running"] = False
+            sync_state["is_syncing"] = False
+            sync_state["is_paused"] = False
+            sync_state["stop_daemon_event"].clear()
+            sync_state["stop_sync_event"].clear()
+            sync_state["pause_sync_event"].clear()
+
+    def test_headless_linux_amazon_login_message_and_dynamic_bookmarklet(self):
+        import os
+        from unittest.mock import patch
+        from src.clients.amazon_login import AmazonBrowserLogin
+
+        login = AmazonBrowserLogin(tld="ca", user_data_dir=str(self.temp_dir.name))
+        with patch("src.clients.amazon_login.sys.platform", "linux"), patch.dict(os.environ, {}, clear=True):
+            login._run_browser_flow()
+        status = login.get_status()
+        self.assertEqual(status["state"], "error")
+        self.assertIn("1-Click Cookie Bookmarklet", status["message"])
+
+        html = self.client.get("/").text
+        self.assertIn("const origin = window.location.origin;", html)
+        self.assertNotIn("fetch('http://127.0.0.1:5050/api/amazon/cookies'", html)
+
 
 if __name__ == "__main__":
     unittest.main()

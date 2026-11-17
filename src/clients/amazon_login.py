@@ -95,6 +95,18 @@ class AmazonBrowserLogin:
     def _run_browser_flow(self):
         ensure_default_desktop()
 
+        if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            msg = (
+                "Interactive browser sign-in is unavailable inside a headless Docker/Unraid container "
+                "(no desktop display). Use the 1-Click Cookie Bookmarklet or paste your Amazon cookies "
+                "(session-id, ubid-acbca, at-acbca) directly under Settings -> Amazon Photos."
+            )
+            logger.warning(msg)
+            with self._lock:
+                self.status["state"] = "error"
+                self.status["message"] = msg
+            return
+
         from playwright.sync_api import sync_playwright
 
         target_url = f"https://www.amazon.{self.tld}/photos"
@@ -226,9 +238,19 @@ class AmazonBrowserLogin:
 
         except Exception as main_err:
             logger.error(f"Amazon browser login failed: {main_err}", exc_info=True)
+            err_str = str(main_err)
+            err_lower = err_str.lower()
+            if "connection closed while reading from the driver" in err_lower or "executable doesn't exist" in err_lower:
+                msg = (
+                    "Browser sign-in could not launch Chrome/Playwright in this environment "
+                    "(expected on headless Docker/Unraid). Use the 1-Click Cookie Bookmarklet or paste your "
+                    "Amazon cookies manually under Settings -> Amazon Photos."
+                )
+            else:
+                msg = f"Error during sign-in: {err_str}"
             with self._lock:
                 self.status["state"] = "error"
-                self.status["message"] = f"Error during sign-in: {main_err}"
+                self.status["message"] = msg
 
 
 def run_cli_login(tld: str = "ca", config_path: str = "config.json"):
