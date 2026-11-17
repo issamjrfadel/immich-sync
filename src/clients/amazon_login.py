@@ -126,6 +126,7 @@ class AmazonBrowserLogin:
                         "--no-sandbox",
                         "--disable-dev-shm-usage",
                         "--window-size=1280,800",
+                        "--window-position=0,0",
                     ])
                     context = p.chromium.launch_persistent_context(
                         user_data_dir=self.user_data_dir,
@@ -155,11 +156,10 @@ class AmazonBrowserLogin:
                 page = context.pages[0] if context.pages else context.new_page()
 
                 novnc_enabled = os.environ.get("ENABLE_NOVNC", "").lower() in ("1", "true", "yes")
-                novnc_port = os.environ.get("NOVNC_PORT", "6080")
                 with self._lock:
                     self.status["state"] = "waiting_for_user"
                     if novnc_enabled:
-                        self.status["message"] = f"Browser ready! Click 'Open Browser View' (port {novnc_port}) and sign in to Amazon."
+                        self.status["message"] = "Browser ready! Sign in to Amazon below — cookies will be captured automatically."
                     else:
                         self.status["message"] = "Please sign in to Amazon in the opened browser window."
 

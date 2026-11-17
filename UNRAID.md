@@ -86,7 +86,7 @@ Instead of manually editing `config.json` or typing all secrets into Unraid XML 
 
 * Open `http://<UNRAID-IP>:5050` in your browser.
 * The daemon starts automatically (`AUTO_DAEMON=true`) and polls at `POLL_INTERVAL_SECONDS` (default `300s`).
-* **Amazon Photos Browser Sign-In (noVNC on port `6080`):** Map container port `6080` -> host `6080` in Unraid. When you click **Settings -> Sign In with Amazon (Auto-Capture) -> Open Sign-In Window**, Playwright launches Chromium on an in-container virtual display (`Xvfb`). Click **Open Browser View (noVNC)** (or open `http://<UNRAID-IP>:6080/vnc.html?autoconnect=1&resize=scale`) to sign into Amazon directly—including 2FA and `HttpOnly` cookies—and cookies are saved automatically to `/app/data/config.json`.
+* **Amazon Photos Browser Sign-In (Embedded inside Web UI + Optional Port `6090`):** When you click **Settings -> Sign In with Amazon (Auto-Capture) -> Open Sign-In Window**, Playwright launches Chromium on an in-container virtual display (`Xvfb`) and embeds the live **Browser View** directly inside the modal over port `5050` (`/novnc/`)—no extra port or new tab required! (You can also optionally pop it out or expose port `6090` directly, which avoids conflicting with `free-games-claimer` on `6080`.) Once you sign into Amazon, your `HttpOnly` and session cookies are captured automatically to `/app/data/config.json`.
   * You can also use the **1-Click Bookmarklet** or manual cookie paste in Settings, and the built-in **2FA Verification** modal for iCloud.
   * When `DASHBOARD_PASSWORD` is set (in Unraid template or `.env`), noVNC/VNC automatically requires that same password before displaying the virtual browser.
 

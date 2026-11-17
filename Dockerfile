@@ -10,7 +10,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     AUTO_DAEMON=true \
     DISPLAY=:99 \
     ENABLE_NOVNC=true \
-    NOVNC_PORT=6080
+    NOVNC_PORT=6090
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -59,7 +59,7 @@ RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoin
     && mkdir -p /app/data
 
 VOLUME ["/app/data"]
-EXPOSE 5050 6080
+EXPOSE 5050 6090
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5050/api/status', timeout=3)" || exit 1

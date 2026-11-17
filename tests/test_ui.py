@@ -358,12 +358,23 @@ class TestUIDashboard(unittest.TestCase):
         self.assertIn("const origin = window.location.origin;", html)
         self.assertNotIn("fetch('http://127.0.0.1:5050/api/amazon/cookies'", html)
 
-        # Verify noVNC metadata & Linux Playwright launch flags
-        with patch.dict(os.environ, {"ENABLE_NOVNC": "true", "NOVNC_PORT": "6080", "DISPLAY": ":99"}):
+        # Verify noVNC metadata & Linux Playwright embedded iframe + static route
+        with patch.dict(os.environ, {"ENABLE_NOVNC": "true", "NOVNC_PORT": "6090", "DISPLAY": ":99"}):
             st = self.client.get("/api/amazon/login/status").json()
             self.assertTrue(st["novnc_enabled"])
-            self.assertEqual(st["novnc_port"], 6080)
+            self.assertEqual(st["novnc_port"], 6090)
         self.assertIn("btnOpenNoVnc", html)
+        self.assertIn("amazonNoVncFrame", html)
+
+        novnc_dir = Path(self.temp_dir.name) / "novnc"
+        novnc_dir.mkdir(parents=True, exist_ok=True)
+        (novnc_dir / "vnc.html").write_text("<html>noVNC OK</html>", encoding="utf-8")
+        with patch.dict(os.environ, {"NOVNC_WEB_DIR": str(novnc_dir)}):
+            r_novnc = self.client.get("/novnc/vnc.html")
+            self.assertEqual(r_novnc.status_code, 200)
+            self.assertIn("noVNC OK", r_novnc.text)
+            r_trav = self.client.get("/novnc/..%2Fconfig.json")
+            self.assertIn(r_trav.status_code, (403, 404))
 
 
 if __name__ == "__main__":

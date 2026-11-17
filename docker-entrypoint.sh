@@ -28,7 +28,7 @@ fi
 if [ "${ENABLE_NOVNC:-false}" = "true" ] && command -v Xvfb >/dev/null 2>&1; then
   DISPLAY="${DISPLAY:-:99}"
   export DISPLAY
-  NOVNC_PORT="${NOVNC_PORT:-6080}"
+  NOVNC_PORT="${NOVNC_PORT:-6090}"
   DISP_NUM="${DISPLAY#:}"
   rm -f "/tmp/.X${DISP_NUM}-lock" 2>/dev/null || true
   Xvfb "$DISPLAY" -screen 0 1280x800x24 -ac +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &

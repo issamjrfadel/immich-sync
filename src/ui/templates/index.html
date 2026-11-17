@@ -711,7 +711,7 @@
 
   <!-- AMAZON BROWSER LOGIN MODAL -->
   <div id="modalAmazonLogin" class="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
-    <div class="bg-darkcard border border-darkborder rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4">
+    <div id="amazonLoginModalCard" class="bg-darkcard border border-darkborder rounded-2xl max-w-lg w-full p-6 shadow-2xl space-y-4 transition-all">
       <div class="flex items-center space-x-3 text-amber-400">
         <div class="w-10 h-10 rounded-xl bg-amber-500/20 text-amber-400 flex items-center justify-center text-lg">
           <i class="fa-brands fa-amazon"></i>
@@ -749,13 +749,18 @@
             <span id="amazonLoginStatusText" class="text-xs text-slate-300">Ready to launch browser.</span>
           </div>
         </div>
+
+        <!-- Embedded in-app browser view (noVNC proxied through Web UI) -->
+        <div id="amazonNoVncWrapper" class="hidden space-y-2 pt-1">
+          <iframe id="amazonNoVncFrame" src="about:blank" class="w-full h-[520px] rounded-xl border border-darkborder bg-slate-950"></iframe>
+        </div>
       </div>
 
       <div class="flex items-center justify-end space-x-3 pt-2">
         <button onclick="closeAmazonLoginModal()" id="btnCancelAmazonLogin" class="px-4 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-slate-200">Close</button>
         <a id="btnOpenNoVnc" href="#" target="_blank" class="hidden bg-sky-600/30 hover:bg-sky-600/40 text-sky-300 border border-sky-500/40 font-semibold px-4 py-2.5 rounded-lg text-xs transition-all flex items-center space-x-1.5">
-          <i class="fa-solid fa-display text-xs"></i>
-          <span>Open Browser View (noVNC)</span>
+          <i class="fa-solid fa-up-right-from-square text-xs"></i>
+          <span>Pop Out</span>
         </a>
         <button onclick="startAmazonBrowserLogin()" id="btnLaunchAmazonLogin" class="bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 text-slate-950 font-bold px-5 py-2.5 rounded-lg text-xs transition-all shadow-md shadow-amber-500/20 flex items-center space-x-1.5">
           <i class="fa-solid fa-arrow-up-right-from-square text-xs"></i>
@@ -1693,8 +1698,24 @@
         launchBtn.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square text-xs"></i> <span>Open Sign-In Window</span>';
       }
       document.getElementById('btnOpenNoVnc')?.classList.add('hidden');
+      resetEmbeddedBrowserView();
 
       document.getElementById('modalAmazonLogin')?.classList.remove('hidden');
+    }
+
+    function resetEmbeddedBrowserView() {
+      const wrapper = document.getElementById('amazonNoVncWrapper');
+      const frame = document.getElementById('amazonNoVncFrame');
+      const card = document.getElementById('amazonLoginModalCard');
+      if (wrapper) wrapper.classList.add('hidden');
+      if (frame) {
+        frame.src = 'about:blank';
+        frame.dataset.loaded = '0';
+      }
+      if (card) {
+        card.classList.remove('max-w-5xl');
+        card.classList.add('max-w-lg');
+      }
     }
 
     function closeAmazonLoginModal() {
@@ -1702,6 +1723,7 @@
         clearInterval(amazonLoginPoller);
         amazonLoginPoller = null;
       }
+      resetEmbeddedBrowserView();
       fetch('/api/amazon/login/cancel', { method: 'POST' }).catch(() => {});
       document.getElementById('modalAmazonLogin')?.classList.add('hidden');
     }
@@ -1752,12 +1774,29 @@
 
     function updateNoVncButton(data) {
       const novncBtn = document.getElementById('btnOpenNoVnc');
-      if (!novncBtn) return;
-      if (data.novnc_enabled && data.novnc_port && ['launching', 'waiting_for_user'].includes(data.state)) {
-        novncBtn.href = `${window.location.protocol}//${window.location.hostname}:${data.novnc_port}/vnc.html?autoconnect=1&resize=scale`;
-        novncBtn.classList.remove('hidden');
+      const wrapper = document.getElementById('amazonNoVncWrapper');
+      const frame = document.getElementById('amazonNoVncFrame');
+      const card = document.getElementById('amazonLoginModalCard');
+      const isActive = data.novnc_enabled && ['launching', 'waiting_for_user'].includes(data.state);
+      const novncUrl = `/novnc/vnc.html?autoconnect=1&resize=scale&path=novnc/websockify`;
+
+      if (isActive) {
+        if (novncBtn) {
+          novncBtn.href = novncUrl;
+          novncBtn.classList.remove('hidden');
+        }
+        if (wrapper) wrapper.classList.remove('hidden');
+        if (card) {
+          card.classList.remove('max-w-lg');
+          card.classList.add('max-w-5xl');
+        }
+        if (frame && frame.dataset.loaded !== '1') {
+          frame.src = novncUrl;
+          frame.dataset.loaded = '1';
+        }
       } else {
-        novncBtn.classList.add('hidden');
+        if (novncBtn) novncBtn.classList.add('hidden');
+        resetEmbeddedBrowserView();
       }
     }
 

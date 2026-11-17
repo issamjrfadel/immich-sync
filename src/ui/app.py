@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv, dotenv_values
@@ -299,43 +299,44 @@ def create_app(
     app = FastAPI(title="Immich Multi-Sync Dashboard", version="1.0.0", lifespan=lifespan)
     app.state.auto_daemon = auto_daemon
 
-    @app.middleware("http")
-    async def optional_basic_auth(request: Request, call_next):
+    def _is_basic_auth_authorized(auth_header: str) -> bool:
         expected_pass = (
             dashboard_password
             if dashboard_password is not None
             else os.environ.get("DASHBOARD_PASSWORD", "").strip()
         )
-        if expected_pass:
-            expected_user = (
-                dashboard_user
-                if dashboard_user is not None
-                else (os.environ.get("DASHBOARD_USER", "admin").strip() or "admin")
-            )
-            client_host = request.client.host if request.client else ""
-            # Allow CORS preflight and localhost Docker healthchecks on /api/status
-            if request.method == "OPTIONS" or (
-                request.url.path == "/api/status" and client_host in ("127.0.0.1", "::1", "localhost")
-            ):
-                return await call_next(request)
+        if not expected_pass:
+            return True
+        expected_user = (
+            dashboard_user
+            if dashboard_user is not None
+            else (os.environ.get("DASHBOARD_USER", "admin").strip() or "admin")
+        )
+        if auth_header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
+                if ":" in decoded:
+                    user, pw = decoded.split(":", 1)
+                    return secrets.compare_digest(user, expected_user) and secrets.compare_digest(pw, expected_pass)
+            except Exception:
+                return False
+        return False
 
-            auth_header = request.headers.get("Authorization", "")
-            authorized = False
-            if auth_header.startswith("Basic "):
-                try:
-                    decoded = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
-                    if ":" in decoded:
-                        user, pw = decoded.split(":", 1)
-                        if secrets.compare_digest(user, expected_user) and secrets.compare_digest(pw, expected_pass):
-                            authorized = True
-                except Exception:
-                    authorized = False
-            if not authorized:
-                return Response(
-                    content="Unauthorized",
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Basic realm="Immich Multi-Sync Dashboard"'},
-                )
+    @app.middleware("http")
+    async def optional_basic_auth(request: Request, call_next):
+        client_host = request.client.host if request.client else ""
+        # Allow CORS preflight and localhost Docker healthchecks on /api/status
+        if request.method == "OPTIONS" or (
+            request.url.path == "/api/status" and client_host in ("127.0.0.1", "::1", "localhost")
+        ):
+            return await call_next(request)
+
+        if not _is_basic_auth_authorized(request.headers.get("Authorization", "")):
+            return Response(
+                content="Unauthorized",
+                status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="Immich Multi-Sync Dashboard"'},
+            )
         return await call_next(request)
 
     app.add_middleware(
@@ -420,23 +421,41 @@ def create_app(
         logger.info(f"Host '{svc}' has been {status_word} via Web UI.")
         return {"success": True, "service": svc, "enabled": req.enabled, "message": f"{svc.capitalize()} {status_word}."}
 
-    @app.post("/api/amazon/cookies")
-    async def receive_amazon_cookies(payload: AmazonCookiesPayload):
+    def _get_or_init_cfg() -> AppConfig:
         cfg = get_cfg()
-        if not cfg:
-            raise HTTPException(status_code=400, detail="Configuration not found")
+        if cfg is not None:
+            return cfg
+        ex_path = Path("config.example.json")
+        if ex_path.exists():
+            return AppConfig.model_validate(json.loads(ex_path.read_text(encoding="utf-8")))
+        from src.config import ImmichConfig, ICloudConfig, AmazonConfig
+        return AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key=""),
+            icloud=ICloudConfig(apple_id=""),
+            amazon=AmazonConfig(cookies={}, tld="ca"),
+        )
 
-        tld = (payload.tld or "ca").lower().strip()
+    def _persist_amazon_cookies(cookies: Dict[str, str], tld: str, details: str, connected: bool = False) -> None:
+        cfg = _get_or_init_cfg()
         cfg.amazon.tld = tld
-        cfg.amazon.cookies = payload.cookies
+        cfg.amazon.cookies = cookies
         cfg.amazon.enabled = True
         cfg.sync.enable_amazon = True
-
         save_config(cfg, config_path)
-        service_status_cache["amazon"]["configured"] = True
+        service_status_cache["amazon"]["configured"] = bool(cookies.get("session-id"))
         service_status_cache["amazon"]["enabled"] = True
-        service_status_cache["amazon"]["details"] = f"Cookies updated via 1-Click Bookmarklet (amazon.{tld})"
+        if connected:
+            service_status_cache["amazon"]["connected"] = True
+        service_status_cache["amazon"]["details"] = details
 
+    @app.post("/api/amazon/cookies")
+    async def receive_amazon_cookies(payload: AmazonCookiesPayload):
+        tld = (payload.tld or "ca").lower().strip()
+        _persist_amazon_cookies(
+            payload.cookies,
+            tld,
+            details=f"Cookies updated via 1-Click Bookmarklet (amazon.{tld})",
+        )
         logger.info(f"Fresh Amazon Photos cookies received and saved via 1-Click Bookmarklet for amazon.{tld}!")
         return {"success": True, "message": f"Successfully synced fresh Amazon Photos cookies (amazon.{tld}) to Immich Multi-Sync!"}
 
@@ -445,18 +464,13 @@ def create_app(
         try:
             parsed = json.loads(data)
             cookies = parsed.get("cookies", {})
-            tld = parsed.get("tld", "ca")
-            cfg = get_cfg()
-            if cfg:
-                cfg.amazon.tld = tld
-                cfg.amazon.cookies = cookies
-                cfg.amazon.enabled = True
-                cfg.sync.enable_amazon = True
-                save_config(cfg, config_path)
-                service_status_cache["amazon"]["configured"] = True
-                service_status_cache["amazon"]["enabled"] = True
-                service_status_cache["amazon"]["details"] = f"Cookies updated via 1-Click Bookmarklet (amazon.{tld})"
-                logger.info("Fresh Amazon Photos cookies imported via bookmarklet redirect!")
+            tld = (parsed.get("tld", "ca") or "ca").lower().strip()
+            _persist_amazon_cookies(
+                cookies,
+                tld,
+                details=f"Cookies updated via 1-Click Bookmarklet (amazon.{tld})",
+            )
+            logger.info("Fresh Amazon Photos cookies imported via bookmarklet redirect!")
 
             html_content = """
             <!DOCTYPE html>
@@ -491,7 +505,7 @@ def create_app(
 
     def _novnc_status_fields() -> Dict[str, Any]:
         enabled = os.environ.get("ENABLE_NOVNC", "").lower() in ("1", "true", "yes")
-        port_raw = os.environ.get("NOVNC_PORT", "6080").strip()
+        port_raw = os.environ.get("NOVNC_PORT", "6090").strip()
         return {
             "novnc_enabled": enabled,
             "novnc_port": int(port_raw) if (enabled and port_raw.isdigit()) else None,
@@ -513,28 +527,23 @@ def create_app(
         active_amazon_login["instance"] = login_mgr
 
         def on_success(cookies: Dict[str, str], resolved_tld: str):
-            cfg = get_cfg()
-            if cfg:
-                cfg.amazon.tld = resolved_tld
-                cfg.amazon.cookies = cookies
-                cfg.amazon.enabled = True
-                cfg.sync.enable_amazon = True
-                save_config(cfg, config_path)
-                service_status_cache["amazon"]["configured"] = True
-                service_status_cache["amazon"]["connected"] = True
-                service_status_cache["amazon"]["enabled"] = True
-                service_status_cache["amazon"]["details"] = f"Connected to Amazon Photos (amazon.{resolved_tld})"
-                logger.info(f"Fresh Amazon session cookies captured & saved for amazon.{resolved_tld}!")
-                if log_broadcaster._loop and log_broadcaster.active_connections:
-                    asyncio.run_coroutine_threadsafe(
-                        log_broadcaster.broadcast({
-                            "timestamp": time.strftime("%H:%M:%S"),
-                            "level": "INFO",
-                            "message": f"Amazon browser login successful! Fresh session cookies saved for amazon.{resolved_tld}.",
-                            "name": "immich_sync.amazon"
-                        }),
-                        log_broadcaster._loop
-                    )
+            _persist_amazon_cookies(
+                cookies,
+                resolved_tld,
+                details=f"Connected to Amazon Photos (amazon.{resolved_tld})",
+                connected=True,
+            )
+            logger.info(f"Fresh Amazon session cookies captured & saved for amazon.{resolved_tld}!")
+            if log_broadcaster._loop and log_broadcaster.active_connections:
+                asyncio.run_coroutine_threadsafe(
+                    log_broadcaster.broadcast({
+                        "timestamp": time.strftime("%H:%M:%S"),
+                        "level": "INFO",
+                        "message": f"Amazon browser login successful! Fresh session cookies saved for amazon.{resolved_tld}.",
+                        "name": "immich_sync.amazon"
+                    }),
+                    log_broadcaster._loop
+                )
 
         started = login_mgr.start(on_success=on_success)
         st = login_mgr.get_status()
@@ -957,5 +966,84 @@ def create_app(
             log_broadcaster.unregister(websocket)
         except Exception:
             log_broadcaster.unregister(websocket)
+
+    def _novnc_root() -> Path:
+        return Path(os.environ.get("NOVNC_WEB_DIR", "/usr/share/novnc"))
+
+    @app.get("/novnc")
+    async def novnc_index():
+        target = _novnc_root() / "vnc.html"
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="noVNC web assets not found")
+        return FileResponse(target)
+
+    @app.get("/novnc/{asset_path:path}")
+    async def novnc_assets(asset_path: str):
+        novnc_dir = _novnc_root()
+        if not novnc_dir.is_dir():
+            raise HTTPException(status_code=404, detail="noVNC web assets not found")
+        rel = asset_path.strip("/") or "vnc.html"
+        root = novnc_dir.resolve()
+        candidate = (root / rel).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        if not candidate.is_file():
+            raise HTTPException(status_code=404, detail="Not found")
+        return FileResponse(candidate)
+
+    @app.websocket("/novnc/websockify")
+    async def novnc_websockify_proxy(websocket: WebSocket):
+        if not _is_basic_auth_authorized(websocket.headers.get("authorization", "")):
+            await websocket.close(code=1008)
+            return
+
+        novnc_port = os.environ.get("NOVNC_PORT", "6090").strip() or "6090"
+        requested_protos = [
+            p.strip() for p in websocket.headers.get("sec-websocket-protocol", "").split(",") if p.strip()
+        ]
+        chosen_proto = "binary" if "binary" in requested_protos else (requested_protos[0] if requested_protos else None)
+        await websocket.accept(subprotocol=chosen_proto)
+
+        import websockets
+        upstream_url = f"ws://127.0.0.1:{novnc_port}/websockify"
+        try:
+            connect_kwargs: Dict[str, Any] = {"max_size": None}
+            if chosen_proto:
+                connect_kwargs["subprotocols"] = [chosen_proto]
+            async with websockets.connect(upstream_url, **connect_kwargs) as upstream:
+                async def client_to_upstream():
+                    while True:
+                        msg = await websocket.receive()
+                        if msg.get("type") == "websocket.disconnect":
+                            break
+                        if msg.get("bytes") is not None:
+                            await upstream.send(msg["bytes"])
+                        elif msg.get("text") is not None:
+                            await upstream.send(msg["text"])
+
+                async def upstream_to_client():
+                    async for data in upstream:
+                        if isinstance(data, (bytes, bytearray)):
+                            await websocket.send_bytes(bytes(data))
+                        else:
+                            await websocket.send_text(str(data))
+
+                _, pending = await asyncio.wait(
+                    [asyncio.create_task(client_to_upstream()), asyncio.create_task(upstream_to_client())],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+        except WebSocketDisconnect:
+            pass
+        except Exception as e:
+            logger.debug(f"noVNC WebSocket proxy ended: {e}")
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     return app
