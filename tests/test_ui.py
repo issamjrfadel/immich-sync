@@ -358,6 +358,13 @@ class TestUIDashboard(unittest.TestCase):
         self.assertIn("const origin = window.location.origin;", html)
         self.assertNotIn("fetch('http://127.0.0.1:5050/api/amazon/cookies'", html)
 
+        # Verify noVNC metadata & Linux Playwright launch flags
+        with patch.dict(os.environ, {"ENABLE_NOVNC": "true", "NOVNC_PORT": "6080", "DISPLAY": ":99"}):
+            st = self.client.get("/api/amazon/login/status").json()
+            self.assertTrue(st["novnc_enabled"])
+            self.assertEqual(st["novnc_port"], 6080)
+        self.assertIn("btnOpenNoVnc", html)
+
 
 if __name__ == "__main__":
     unittest.main()

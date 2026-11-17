@@ -11,6 +11,7 @@ services:
         required: false
     ports:
       - "5050:5050"
+      - "6080:6080" # noVNC web viewer for interactive Amazon browser sign-in
     volumes:
       # On Unraid, map your appdata share here, e.g.:
       # - /mnt/user/appdata/immich-sync:/app/data

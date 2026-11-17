@@ -115,34 +115,53 @@ class AmazonBrowserLogin:
         try:
             with sync_playwright() as p:
                 context = None
+                is_linux = sys.platform.startswith("linux")
                 launch_args = [
-                    "--start-maximized",
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--disable-blink-features=AutomationControlled"
                 ]
-                try:
-                    context = p.chromium.launch_persistent_context(
-                        user_data_dir=self.user_data_dir,
-                        channel="chrome",
-                        headless=False,
-                        args=launch_args,
-                        viewport=None
-                    )
-                except Exception as e_chrome:
-                    logger.warning(f"Could not launch Chrome via channel='chrome' ({e_chrome}). Falling back to Chromium.")
+                if is_linux:
+                    launch_args.extend([
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--window-size=1280,800",
+                    ])
                     context = p.chromium.launch_persistent_context(
                         user_data_dir=self.user_data_dir,
                         headless=False,
                         args=launch_args,
-                        viewport=None
+                        viewport={"width": 1280, "height": 800}
                     )
+                else:
+                    launch_args.append("--start-maximized")
+                    try:
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir=self.user_data_dir,
+                            channel="chrome",
+                            headless=False,
+                            args=launch_args,
+                            viewport=None
+                        )
+                    except Exception as e_chrome:
+                        logger.warning(f"Could not launch Chrome via channel='chrome' ({e_chrome}). Falling back to Chromium.")
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir=self.user_data_dir,
+                            headless=False,
+                            args=launch_args,
+                            viewport=None
+                        )
 
                 page = context.pages[0] if context.pages else context.new_page()
 
+                novnc_enabled = os.environ.get("ENABLE_NOVNC", "").lower() in ("1", "true", "yes")
+                novnc_port = os.environ.get("NOVNC_PORT", "6080")
                 with self._lock:
                     self.status["state"] = "waiting_for_user"
-                    self.status["message"] = f"Please sign in to Amazon in the opened browser window."
+                    if novnc_enabled:
+                        self.status["message"] = f"Browser ready! Click 'Open Browser View' (port {novnc_port}) and sign in to Amazon."
+                    else:
+                        self.status["message"] = "Please sign in to Amazon in the opened browser window."
 
                 try:
                     page.goto(target_url, wait_until="domcontentloaded", timeout=45000)

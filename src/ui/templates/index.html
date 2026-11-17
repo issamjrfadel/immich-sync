@@ -745,7 +745,7 @@
           <div id="amazonLoginStatusIcon" class="w-7 h-7 rounded-full bg-slate-800 text-slate-400 flex items-center justify-center text-xs shrink-0">
             <i class="fa-solid fa-info"></i>
           </div>
-          <div class="flex-1 truncate">
+          <div class="flex-1 min-w-0 break-words">
             <span id="amazonLoginStatusText" class="text-xs text-slate-300">Ready to launch browser.</span>
           </div>
         </div>
@@ -753,6 +753,10 @@
 
       <div class="flex items-center justify-end space-x-3 pt-2">
         <button onclick="closeAmazonLoginModal()" id="btnCancelAmazonLogin" class="px-4 py-2 rounded-lg text-xs font-medium text-slate-400 hover:text-slate-200">Close</button>
+        <a id="btnOpenNoVnc" href="#" target="_blank" class="hidden bg-sky-600/30 hover:bg-sky-600/40 text-sky-300 border border-sky-500/40 font-semibold px-4 py-2.5 rounded-lg text-xs transition-all flex items-center space-x-1.5">
+          <i class="fa-solid fa-display text-xs"></i>
+          <span>Open Browser View (noVNC)</span>
+        </a>
         <button onclick="startAmazonBrowserLogin()" id="btnLaunchAmazonLogin" class="bg-gradient-to-r from-amber-600 to-amber-500 hover:from-amber-500 text-slate-950 font-bold px-5 py-2.5 rounded-lg text-xs transition-all shadow-md shadow-amber-500/20 flex items-center space-x-1.5">
           <i class="fa-solid fa-arrow-up-right-from-square text-xs"></i>
           <span>Open Sign-In Window</span>
@@ -1688,6 +1692,7 @@
         launchBtn.disabled = false;
         launchBtn.innerHTML = '<i class="fa-solid fa-arrow-up-right-from-square text-xs"></i> <span>Open Sign-In Window</span>';
       }
+      document.getElementById('btnOpenNoVnc')?.classList.add('hidden');
 
       document.getElementById('modalAmazonLogin')?.classList.remove('hidden');
     }
@@ -1726,6 +1731,8 @@
           body: JSON.stringify({ tld: tld })
         });
         const data = await res.json();
+        const st = data.login_status || {};
+        updateNoVncButton(st);
 
         if (amazonLoginPoller) clearInterval(amazonLoginPoller);
         amazonLoginPoller = setInterval(pollAmazonLoginStatus, 1200);
@@ -1743,6 +1750,17 @@
       }
     }
 
+    function updateNoVncButton(data) {
+      const novncBtn = document.getElementById('btnOpenNoVnc');
+      if (!novncBtn) return;
+      if (data.novnc_enabled && data.novnc_port && ['launching', 'waiting_for_user'].includes(data.state)) {
+        novncBtn.href = `${window.location.protocol}//${window.location.hostname}:${data.novnc_port}/vnc.html?autoconnect=1&resize=scale`;
+        novncBtn.classList.remove('hidden');
+      } else {
+        novncBtn.classList.add('hidden');
+      }
+    }
+
     async function pollAmazonLoginStatus() {
       try {
         const res = await fetch('/api/amazon/login/status');
@@ -1754,6 +1772,7 @@
         const launchBtn = document.getElementById('btnLaunchAmazonLogin');
 
         if (statusText && data.message) statusText.innerText = data.message;
+        updateNoVncButton(data);
 
         if (data.state === 'success') {
           if (amazonLoginPoller) {

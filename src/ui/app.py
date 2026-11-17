@@ -489,6 +489,14 @@ def create_app(
 
     active_amazon_login: Dict[str, Any] = {"instance": None}
 
+    def _novnc_status_fields() -> Dict[str, Any]:
+        enabled = os.environ.get("ENABLE_NOVNC", "").lower() in ("1", "true", "yes")
+        port_raw = os.environ.get("NOVNC_PORT", "6080").strip()
+        return {
+            "novnc_enabled": enabled,
+            "novnc_port": int(port_raw) if (enabled and port_raw.isdigit()) else None,
+        }
+
     @app.post("/api/amazon/login/start")
     async def start_amazon_login(payload: Optional[AmazonLoginStartRequest] = None):
         tld = (payload.tld if payload and payload.tld else "ca").lower().strip()
@@ -496,6 +504,7 @@ def create_app(
         if existing:
             st = existing.get_status()
             if st.get("state") in ("launching", "waiting_for_user", "verifying"):
+                st.update(_novnc_status_fields())
                 return {"status": "already_running", "login_status": st}
 
         from src.clients.amazon_login import AmazonBrowserLogin
@@ -528,14 +537,19 @@ def create_app(
                     )
 
         started = login_mgr.start(on_success=on_success)
-        return {"status": "started" if started else "failed", "login_status": login_mgr.get_status()}
+        st = login_mgr.get_status()
+        st.update(_novnc_status_fields())
+        return {"status": "started" if started else "failed", "login_status": st}
 
     @app.get("/api/amazon/login/status")
     async def get_amazon_login_status():
         existing = active_amazon_login.get("instance")
         if not existing:
-            return {"state": "idle", "message": "No login session active."}
-        return existing.get_status()
+            st = {"state": "idle", "message": "No login session active."}
+        else:
+            st = existing.get_status()
+        st.update(_novnc_status_fields())
+        return st
 
     @app.post("/api/amazon/login/cancel")
     async def cancel_amazon_login():
