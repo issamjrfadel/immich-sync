@@ -104,6 +104,15 @@
   <!-- MAIN CONTAINER -->
   <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 flex-1 w-full">
 
+    <!-- PERSISTENCE WARNING BANNER (shown if /app/data is not bound in Docker) -->
+    <div id="storageWarningBanner" class="hidden mb-6 bg-rose-950/70 border border-rose-500/50 text-rose-200 px-4 py-3 rounded-xl flex items-start space-x-3 text-xs">
+      <i class="fa-solid fa-triangle-exclamation text-rose-400 text-base mt-0.5 shrink-0"></i>
+      <div class="space-y-0.5">
+        <div class="font-bold text-rose-300">Configuration Persistence Warning</div>
+        <div id="storageWarningText" class="text-rose-200/90 leading-relaxed"></div>
+      </div>
+    </div>
+
     <!-- TAB 1: DASHBOARD -->
     <div id="tab-dashboard" class="space-y-6">
 
@@ -923,6 +932,17 @@
           } else {
             oneWayBadge.classList.add('hidden');
             oneWayBadge.classList.remove('flex');
+          }
+        }
+
+        const storageBanner = document.getElementById('storageWarningBanner');
+        const storageText = document.getElementById('storageWarningText');
+        if (storageBanner && storageText) {
+          if (data.storage_warning) {
+            storageText.innerText = data.storage_warning;
+            storageBanner.classList.remove('hidden');
+          } else {
+            storageBanner.classList.add('hidden');
           }
         }
       } catch (err) {

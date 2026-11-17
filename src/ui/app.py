@@ -1,4 +1,5 @@
 import os
+import re
 import copy
 import json
 import time
@@ -268,9 +269,50 @@ class AmazonCookiesPayload(BaseModel):
 class AmazonLoginStartRequest(BaseModel):
     tld: Optional[str] = "ca"
 
+def get_storage_warning(
+    data_dir: Path,
+    mountinfo_path: Path = Path("/proc/self/mountinfo"),
+    dockerenv_path: Path = Path("/.dockerenv"),
+) -> str:
+    """Warn when running inside Docker without a persistent host bind mount at data_dir."""
+    if not dockerenv_path.exists() or not mountinfo_path.is_file():
+        return ""
+    try:
+        target = str(data_dir.resolve())
+        lines = mountinfo_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return ""
+
+    matched_root = None
+    for line in lines:
+        parts = line.split(" - ", 1)[0].split(" ")
+        if len(parts) < 5:
+            continue
+        root = parts[3].replace("\\040", " ")
+        mount_point = parts[4].replace("\\040", " ")
+        if mount_point == target:
+            matched_root = root
+            break
+
+    if matched_root is None:
+        return (
+            f"Storage warning: '{target}' is not mounted to a persistent host folder. "
+            f"Map Host Path '/mnt/user/appdata/immich-sync' -> Container Path '{target}' so settings survive updates."
+        )
+    if re.search(r"(?:^|/)[0-9a-f]{64}/_data$", matched_root):
+        return (
+            f"Storage warning: '{target}' is using a temporary anonymous Docker volume instead of your Unraid appdata share. "
+            f"Set Container Path to '{target}' and Host Path to '/mnt/user/appdata/immich-sync' so settings survive updates."
+        )
+    return ""
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log_broadcaster.set_loop(asyncio.get_running_loop())
+    storage_warn = getattr(app.state, "storage_warning", "")
+    if storage_warn:
+        logger.warning(storage_warn)
     auto_daemon = getattr(app.state, "auto_daemon", False)
     start_fn = getattr(app.state, "start_daemon_fn", None)
     if auto_daemon and callable(start_fn):
@@ -298,6 +340,8 @@ def create_app(
 
     app = FastAPI(title="Immich Multi-Sync Dashboard", version="1.0.0", lifespan=lifespan)
     app.state.auto_daemon = auto_daemon
+    data_dir = Path(os.environ.get("DATA_DIR", "").strip() or Path(config_path).parent)
+    app.state.storage_warning = get_storage_warning(data_dir)
 
     def _is_basic_auth_authorized(auth_header: str) -> bool:
         expected_pass = (
@@ -390,7 +434,9 @@ def create_app(
             },
             "services": service_status_cache,
             "progress": sync_progress,
-            "one_way_immich_master": getattr(cfg.sync, "one_way_immich_master", True) if cfg else True
+            "one_way_immich_master": getattr(cfg.sync, "one_way_immich_master", True) if cfg else True,
+            "storage_warning": app.state.storage_warning,
+            "config_path": str(Path(config_path).resolve()),
         }
 
     @app.get("/api/sync/progress")

@@ -271,27 +271,24 @@ class AmazonPhotosClient:
 
         return None
 
-    def find_by_md5(self, md5_hash: str) -> Optional[str]:
-        """
-        Find photo node ID by its MD5 checksum using the /nodes endpoint.
-        Does NOT use /search, preventing 400 Bad Request 'Invalid fieldName: contentProperties.md5'.
-        """
+    def find_nodes_by_md5(self, md5_hash: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Find photo nodes by MD5 checksum using the /nodes endpoint."""
         if not md5_hash or self.session_expired:
-            return None
+            return []
         try:
             ap = self._ensure_client()
             url = f"{ap.drive_url}/nodes"
             params = {
                 "filters": f"contentProperties.md5:{md5_hash}",
-                "limit": 1,
+                "limit": limit,
                 "asset": "ALL",
                 "tempLink": "false"
             }
             resp = ap.client.get(url, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json().get("data", [])
-                if data and isinstance(data, list) and len(data) > 0:
-                    return data[0].get("id")
+                if data and isinstance(data, list):
+                    return data
             elif resp.status_code == 400:
                 logger.debug(f"Amazon /nodes query returned 400: {resp.text[:120]}")
             elif resp.status_code == 401:
@@ -299,8 +296,15 @@ class AmazonPhotosClient:
                 logger.warning("[Amazon Photos] Session cookies expired. Fast-failing Amazon checks for remaining photos.")
         except Exception as e:
             logger.debug(f"MD5 search failed: {e}")
-        return None
-        return None
+        return []
+
+    def find_by_md5(self, md5_hash: str) -> Optional[str]:
+        """
+        Find photo node ID by its MD5 checksum using the /nodes endpoint.
+        Does NOT use /search, preventing 400 Bad Request 'Invalid fieldName: contentProperties.md5'.
+        """
+        nodes = self.find_nodes_by_md5(md5_hash, limit=1)
+        return nodes[0].get("id") if nodes else None
 
     def trash_nodes(self, node_ids: List[str]) -> bool:
         """Move photo/video nodes to Amazon Photos Trash."""

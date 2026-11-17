@@ -1,4 +1,6 @@
 import time
+import base64
+import sqlite3
 import logging
 import shutil
 import threading
@@ -541,15 +543,43 @@ class SyncEngine:
             if a.get("immich_id") and a["immich_id"] not in live_immich_ids
         ]
 
-        if not deletion_candidates:
+        untracked_trashed: List[Dict[str, Any]] = []
+        if self.is_amazon_enabled and not getattr(self.amazon, "session_expired", False):
+            try:
+                trashed_immich = self.immich.get_trashed_assets()
+            except Exception as e:
+                logger.debug(f"Could not query Immich Trash: {e}")
+                trashed_immich = []
+
+            for ta in trashed_immich:
+                tid = ta.get("id")
+                if not tid:
+                    continue
+                existing = self.db.get_asset_by_immich_id(tid)
+                if existing:
+                    # ACTIVE items are handled by deletion_candidates; already-deleted items are skipped.
+                    continue
+                sha1_hex = self._decode_immich_checksum(ta.get("checksum"))
+                if sha1_hex:
+                    by_sha1 = self.db.get_asset_by_sha1(sha1_hex)
+                    if by_sha1:
+                        if by_sha1.get("status") != "ACTIVE":
+                            continue
+                untracked_trashed.append(ta)
+
+        total_candidates = len(deletion_candidates) + len(untracked_trashed)
+        if total_candidates == 0:
             logger.info("No deleted assets detected in Immich.")
             self.report_progress(90, "deletions", "Deletions Checked", 0, 0, "", "No deleted assets detected in Immich.")
             return 0
 
-        num_deletions = len(deletion_candidates)
+        num_deletions = total_candidates
         max_limit = self.config.sync.max_delete_limit
 
-        logger.info(f"Detected {num_deletions} assets deleted in Immich.")
+        logger.info(
+            f"Detected {num_deletions} deleted/trashed assets in Immich "
+            f"({len(deletion_candidates)} tracked, {len(untracked_trashed)} untracked in Trash)."
+        )
 
         if num_deletions > max_limit and not force:
             msg = (
@@ -626,11 +656,136 @@ class SyncEngine:
                 else:
                     logger.warning(f"Deletion of '{filename}' deferred: target service failed (Amazon OK: {amazon_ok}, iCloud OK: {icloud_ok}).")
 
+        offset = len(deletion_candidates)
+        for idx, ta in enumerate(untracked_trashed):
+            if getattr(self.amazon, "session_expired", False):
+                break
+            filename = ta.get("originalFileName", ta.get("id", "asset"))
+            overall_idx = offset + idx
+            pct = 70 + int((overall_idx / num_deletions) * 20)
+            if self.check_pause_and_stop(filename, pct, overall_idx + 1, num_deletions):
+                logger.info(f"Stop signal received during Immich Trash check at {overall_idx + 1}/{num_deletions}.")
+                break
+
+            self.report_progress(
+                pct,
+                "deletions",
+                "Checking Immich Trash",
+                overall_idx + 1,
+                num_deletions,
+                filename,
+                f"Checking Immich Trash {overall_idx + 1}/{num_deletions}: {filename}",
+            )
+            if self._trash_untracked_immich_asset(ta):
+                synced_count += 1
+
         if self.stop_event and self.stop_event.is_set():
             return synced_count
 
         self.report_progress(90, "deletions", "Deletions Synced", num_deletions, num_deletions, "", f"Propagated {synced_count} deletions from Immich.")
         return synced_count
+
+    @staticmethod
+    def _decode_immich_checksum(checksum: Optional[str]) -> Optional[str]:
+        if not checksum:
+            return None
+        try:
+            raw = base64.b64decode(checksum)
+            if len(raw) == 20:
+                return raw.hex()
+        except Exception:
+            pass
+        return None
+
+    def _trash_untracked_immich_asset(self, asset: Dict[str, Any]) -> bool:
+        """Match an untracked Immich Trash asset on Amazon Photos by MD5, trash it, and record as deleted."""
+        immich_id = asset["id"]
+        filename = asset.get("originalFileName", f"{immich_id}.bin")
+        staging_path = self.temp_dir / f"immich_trash_{immich_id}_{filename}"
+
+        try:
+            self.immich.download_asset(immich_id, staging_path)
+            sha1, md5 = compute_hashes(staging_path)
+            file_size = staging_path.stat().st_size
+
+            nodes = self.amazon.find_nodes_by_md5(md5)
+            if not nodes:
+                fallback_id = self.amazon.find_by_md5(md5)
+                if fallback_id:
+                    nodes = [{"id": fallback_id, "status": "AVAILABLE"}]
+
+            active_ids = [
+                n["id"] for n in nodes
+                if n.get("id") and str(n.get("status") or "").upper() != "TRASH"
+            ]
+            trashed_ids = [
+                n["id"] for n in nodes
+                if n.get("id") and str(n.get("status") or "").upper() == "TRASH"
+            ]
+
+            matched_amazon_id: Optional[str] = None
+            counted_deleted = False
+
+            if active_ids:
+                if self.dry_run:
+                    logger.info(f"  -> [DRY RUN] Would move Immich Trash item '{filename}' to Amazon Photos Trash.")
+                    return False
+                if not self.amazon.trash_nodes(active_ids):
+                    logger.warning(f"Failed to trash Immich Trash item '{filename}' on Amazon Photos; will retry.")
+                    return False
+                matched_amazon_id = active_ids[0]
+                counted_deleted = True
+                logger.info(f"  -> Moved Immich Trash item '{filename}' to Amazon Photos Trash (ID: {matched_amazon_id}).")
+            elif trashed_ids:
+                if self.dry_run:
+                    return False
+                matched_amazon_id = trashed_ids[0]
+                counted_deleted = True
+                logger.info(f"  -> Recorded Immich Trash item '{filename}' as already in Amazon Trash.")
+            else:
+                if self.dry_run:
+                    return False
+                logger.debug(f"Immich Trash item '{filename}' not present on Amazon Photos; marking deleted in DB.")
+
+            try:
+                self.db.upsert_asset(
+                    sha1=sha1,
+                    md5=md5,
+                    filename=filename,
+                    file_size=file_size,
+                    immich_id=immich_id,
+                    amazon_id=matched_amazon_id,
+                    status="DELETED_IN_IMMICH",
+                )
+            except sqlite3.IntegrityError:
+                self.db.upsert_asset(
+                    sha1=sha1,
+                    md5=md5,
+                    filename=filename,
+                    file_size=file_size,
+                    immich_id=immich_id,
+                    amazon_id=None,
+                    status="DELETED_IN_IMMICH",
+                )
+
+            if counted_deleted:
+                self.db.log_sync("DELETE", f"Synced Immich trash of {filename}")
+            return counted_deleted
+        except Exception as e:
+            logger.warning(f"Failed checking Immich Trash item '{filename}': {e}")
+            return False
+        finally:
+            if staging_path.exists():
+                try:
+                    staging_path.unlink()
+                except OSError:
+                    pass
+            part_path = staging_path.with_suffix(staging_path.suffix + ".part")
+            if part_path.exists():
+                try:
+                    part_path.unlink()
+                except OSError:
+                    pass
 
     def _sync_albums(self) -> int:
         immich_albums = self.immich.get_albums()

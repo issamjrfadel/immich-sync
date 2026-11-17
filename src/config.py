@@ -198,8 +198,16 @@ def load_config(config_path: str | Path = "config.json") -> AppConfig:
 def save_config(config: AppConfig, config_path: str | Path = "config.json"):
     path = Path(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    tmp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(config.model_dump(), f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, path)
     try:
         os.chmod(path, 0o600)
     except OSError:

@@ -99,21 +99,16 @@ class ImmichClient:
             res_json = resp.json()
             return res_json.get("id")
 
-    def get_all_assets(self, page_size: int = 1000) -> List[Dict[str, Any]]:
-        """Fetch all active assets from Immich across paginated search."""
+    def _search_metadata_paginated(self, base_payload: Dict[str, Any], page_size: int = 1000) -> List[Dict[str, Any]]:
+        """Execute paginated POST /api/search/metadata queries."""
         url = self._url("/api/search/metadata")
         page = 1
-        all_assets = []
+        all_assets: List[Dict[str, Any]] = []
 
         while True:
-            payload = {
-                "page": page,
-                "size": page_size,
-                "withExif": True
-            }
+            payload = {**base_payload, "page": page, "size": page_size}
             resp = self.session.post(url, json=payload, headers=self.headers, verify=self.verify_ssl, timeout=60)
             if resp.status_code == 404:
-                # Fallback to GET /api/assets if search endpoint behaves differently
                 break
             resp.raise_for_status()
             data = resp.json()
@@ -139,6 +134,18 @@ class ImmichClient:
             page += 1
 
         return all_assets
+
+    def get_all_assets(self, page_size: int = 1000) -> List[Dict[str, Any]]:
+        """Fetch all active assets from Immich across paginated search."""
+        return self._search_metadata_paginated({"withExif": True}, page_size=page_size)
+
+    def get_trashed_assets(self, page_size: int = 1000) -> List[Dict[str, Any]]:
+        """Fetch assets currently sitting in Immich Trash."""
+        results = self._search_metadata_paginated(
+            {"withDeleted": True, "trashedAfter": "1970-01-01T00:00:00.000Z"},
+            page_size=page_size,
+        )
+        return [item for item in results if item.get("isTrashed") or item.get("deletedAt")]
 
     def download_asset(self, asset_id: str, dest_path: Path, max_retries: int = 2) -> Path:
         """

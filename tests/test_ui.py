@@ -376,6 +376,35 @@ class TestUIDashboard(unittest.TestCase):
             r_trav = self.client.get("/novnc/..%2Fconfig.json")
             self.assertIn(r_trav.status_code, (403, 404))
 
+    def test_storage_warning_detects_anonymous_or_missing_mount(self):
+        from src.ui.app import get_storage_warning
+
+        data_dir = Path(self.temp_dir.name) / "appdata"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        resolved = str(data_dir.resolve()).replace(" ", "\\040")
+        dockerenv = Path(self.temp_dir.name) / ".dockerenv"
+        dockerenv.write_text("", encoding="utf-8")
+        mountinfo = Path(self.temp_dir.name) / "mountinfo"
+
+        # 1. Missing dedicated mount for data_dir
+        mountinfo.write_text("10 1 0:1 / / rw,relatime - overlay overlay rw\n", encoding="utf-8")
+        self.assertIn("not mounted", get_storage_warning(data_dir, mountinfo, dockerenv))
+
+        # 2. Anonymous Docker volume (64-hex volume ID + /_data)
+        anon_id = "a" * 64
+        mountinfo.write_text(
+            f"11 1 8:1 /var/lib/docker/volumes/{anon_id}/_data {resolved} rw,relatime - ext4 /dev/sda1 rw\n",
+            encoding="utf-8",
+        )
+        self.assertIn("anonymous Docker volume", get_storage_warning(data_dir, mountinfo, dockerenv))
+
+        # 3. Valid persistent host bind mount
+        mountinfo.write_text(
+            f"12 1 0:50 /mnt/user/appdata/immich-sync {resolved} rw,relatime - fuse.shfs shfs rw\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(get_storage_warning(data_dir, mountinfo, dockerenv), "")
+
 
 if __name__ == "__main__":
     unittest.main()

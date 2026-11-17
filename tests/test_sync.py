@@ -605,6 +605,88 @@ class TestSyncComponents(unittest.TestCase):
         self.assertTrue(overridden.icloud.upload_videos)
         self.assertTrue(overridden.sync.sync_videos_to_icloud)
 
+    def test_untracked_immich_trash_trashed_on_amazon_and_counted_as_deleted(self):
+        import base64
+        import hashlib
+
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com", enabled=False),
+            amazon=AmazonConfig(cookies={"session-id": "test"}, enabled=True),
+            sync=SyncSettings(
+                max_delete_limit=10,
+                sync_deletions=True,
+                enable_icloud=False,
+                download_temp_dir=str(self.temp_dir.name),
+                dry_run=False,
+            ),
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        content_active = b"trashed-in-immich-still-available-on-amazon"
+        content_already_amz_trash = b"trashed-in-immich-already-in-amazon-trash"
+        sha1_a = hashlib.sha1(content_active).digest()
+        sha1_b = hashlib.sha1(content_already_amz_trash).digest()
+
+        trashed_items = [
+            {
+                "id": "immich-trash-1",
+                "originalFileName": "old_photo.jpg",
+                "isTrashed": True,
+                "checksum": base64.b64encode(sha1_a).decode("ascii"),
+            },
+            {
+                "id": "immich-trash-2",
+                "originalFileName": "already_amz_trashed.jpg",
+                "isTrashed": True,
+                "checksum": base64.b64encode(sha1_b).decode("ascii"),
+            },
+        ]
+
+        engine.immich.get_all_assets = MagicMock(return_value=[])
+        engine.immich.get_trashed_assets = MagicMock(return_value=trashed_items)
+
+        def fake_download(asset_id, dest_path):
+            Path(dest_path).write_bytes(content_active if asset_id == "immich-trash-1" else content_already_amz_trash)
+            return Path(dest_path)
+
+        engine.immich.download_asset = MagicMock(side_effect=fake_download)
+
+        md5_a = hashlib.md5(content_active).hexdigest()
+        md5_b = hashlib.md5(content_already_amz_trash).hexdigest()
+
+        def fake_find_nodes(md5_hash, limit=5):
+            if md5_hash == md5_a:
+                return [{"id": "amz-node-available", "status": "AVAILABLE"}]
+            if md5_hash == md5_b:
+                return [{"id": "amz-node-trashed", "status": "TRASH"}]
+            return []
+
+        engine.amazon.find_nodes_by_md5 = MagicMock(side_effect=fake_find_nodes)
+        engine.amazon.trash_nodes = MagicMock(return_value=True)
+
+        # First cycle: trashes active Amazon node, records both as DELETED_IN_IMMICH, counts both (2)
+        deleted = engine._sync_deletions()
+        self.assertEqual(deleted, 2)
+        engine.amazon.trash_nodes.assert_called_once_with(["amz-node-available"])
+
+        rec1 = engine.db.get_asset_by_immich_id("immich-trash-1")
+        rec2 = engine.db.get_asset_by_immich_id("immich-trash-2")
+        self.assertEqual(rec1["status"], "DELETED_IN_IMMICH")
+        self.assertEqual(rec1["amazon_id"], "amz-node-available")
+        self.assertEqual(rec2["status"], "DELETED_IN_IMMICH")
+        self.assertEqual(rec2["amazon_id"], "amz-node-trashed")
+
+        # Second cycle: already recorded in DB -> 0 downloads, 0 Amazon calls, 0 deletions
+        engine.immich.download_asset.reset_mock()
+        engine.amazon.find_nodes_by_md5.reset_mock()
+        engine.amazon.trash_nodes.reset_mock()
+        deleted_again = engine._sync_deletions()
+        self.assertEqual(deleted_again, 0)
+        engine.immich.download_asset.assert_not_called()
+        engine.amazon.find_nodes_by_md5.assert_not_called()
+        engine.amazon.trash_nodes.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
