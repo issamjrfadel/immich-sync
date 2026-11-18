@@ -785,6 +785,45 @@ class TestSyncComponents(unittest.TestCase):
         self.assertEqual(loaded.notifications.apprise_urls, ["tgram://111222:TOKEN/555666777"])
         self.assertEqual(loaded.notifications.daily_summary_hour, 20)
 
+    def test_amazon_album_add_skips_existing_and_retries_503(self):
+        from src.clients.amazon import AmazonPhotosClient
+
+        client = AmazonPhotosClient(AmazonConfig(cookies={"session-id": "test-sess"}, tld="ca"))
+        fake_ap = MagicMock()
+        fake_ap.drive_url = "https://www.amazon.ca/drive/v1"
+        fake_ap.base_params = {"asset": "ALL"}
+
+        # Existing album already has node-1; node-2 is new, CONFLICT_EXISTING should be filtered
+        get_resp = MagicMock()
+        get_resp.status_code = 200
+        get_resp.json.return_value = {"count": 1, "data": [{"id": "node-1"}]}
+        fake_ap.client.get.return_value = get_resp
+
+        # First PATCH returns 503 HTML, second PATCH succeeds with 202, cover PATCH returns 200
+        resp_503 = MagicMock(status_code=503, text="<!doctype html><html>503</html>")
+        resp_202 = MagicMock(status_code=202, text="")
+        resp_cover = MagicMock(status_code=200, text="")
+        fake_ap.client.patch.side_effect = [resp_503, resp_202, resp_cover]
+        client._ap = fake_ap
+
+        with patch("src.clients.amazon.time.sleep"):
+            ok = client.add_to_album("alb-1", ["node-1", "node-2", "CONFLICT_EXISTING"], cover_node_id="node-1")
+
+        self.assertTrue(ok)
+        children_patches = [
+            c for c in fake_ap.client.patch.call_args_list
+            if "/children" in c.args[0]
+        ]
+        self.assertEqual(len(children_patches), 2)
+        self.assertEqual(children_patches[0].kwargs["json"]["value"], ["node-2"])
+
+        # When all nodes are already in the album, 0 PATCH calls happen
+        fake_ap.client.patch.reset_mock()
+        get_resp.json.return_value = {"count": 2, "data": [{"id": "node-1"}, {"id": "node-2"}]}
+        ok2 = client.add_to_album("alb-1", ["node-1", "node-2"])
+        self.assertTrue(ok2)
+        fake_ap.client.patch.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

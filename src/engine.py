@@ -825,14 +825,14 @@ class SyncEngine:
             amazon_node_ids = []
             for aid in asset_ids:
                 record = self.db.get_asset_by_immich_id(aid)
-                if record and record.get("amazon_id") and not record["amazon_id"].startswith("dry_run"):
+                if record and record.get("amazon_id") and record["amazon_id"] != "CONFLICT_EXISTING" and not record["amazon_id"].startswith("dry_run"):
                     amazon_node_ids.append(record["amazon_id"])
 
             thumb_asset_id = details.get("albumThumbnailAssetId")
             cover_node_id = None
             if thumb_asset_id:
                 thumb_rec = self.db.get_asset_by_immich_id(thumb_asset_id)
-                if thumb_rec and thumb_rec.get("amazon_id") and not thumb_rec["amazon_id"].startswith("dry_run"):
+                if thumb_rec and thumb_rec.get("amazon_id") and thumb_rec["amazon_id"] != "CONFLICT_EXISTING" and not thumb_rec["amazon_id"].startswith("dry_run"):
                     cover_node_id = thumb_rec["amazon_id"]
 
             db_album = self.db.get_album(immich_album_id)

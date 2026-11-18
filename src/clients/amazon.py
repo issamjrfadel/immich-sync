@@ -355,33 +355,110 @@ class AmazonPhotosClient:
             logger.error(f"Failed to create Amazon Photos album '{album_name}': {e}")
             return None
 
+    def get_album_children_ids(self, album_id: str) -> Optional[set[str]]:
+        """Fetch node IDs currently inside an Amazon Photos album (returns None on query failure)."""
+        if not album_id or self.session_expired:
+            return None
+        ap = self._ensure_client()
+        child_ids: set[str] = set()
+        offset = 0
+        limit = 200
+        try:
+            while True:
+                params = {"limit": limit, "offset": offset} | ap.base_params
+                resp = ap.client.get(f"{ap.drive_url}/nodes/{album_id}/children", params=params, timeout=20)
+                if resp.status_code == 401:
+                    self.session_expired = True
+                    return None
+                if resp.status_code != 200:
+                    return None
+                body = resp.json()
+                items = body.get("data", []) or []
+                for item in items:
+                    if isinstance(item, dict) and item.get("id"):
+                        child_ids.add(item["id"])
+                total_count = body.get("count")
+                if not items or len(items) < limit or (total_count is not None and offset + len(items) >= total_count):
+                    break
+                offset += len(items)
+            return child_ids
+        except Exception as e:
+            logger.debug(f"Could not list children of Amazon album {album_id}: {e}")
+            return None
+
+    def _patch_album_chunk_with_retry(self, ap: RegionalAmazonPhotos, album_id: str, chunk: List[str], retries: int = 3) -> bool:
+        """Patch a chunk of nodes into an Amazon album, retrying transient 429/5xx (including 503)."""
+        last_status = None
+        last_body = ""
+        for attempt in range(retries + 1):
+            resp = ap.client.patch(
+                f"{ap.drive_url}/nodes/{album_id}/children",
+                json={
+                    "op": "add",
+                    "value": chunk,
+                    "resourceVersion": "V2",
+                    "ContentType": "JSON",
+                },
+                timeout=20,
+            )
+            if resp.status_code in (200, 202, 204):
+                return True
+            last_status = resp.status_code
+            last_body = (resp.text or "")[:120]
+            if resp.status_code == 401:
+                self.session_expired = True
+                logger.warning("Amazon Photos session cookies expired during album update.")
+                return False
+            if resp.status_code in (429, 500, 502, 503, 504) and attempt < retries:
+                time.sleep(1.5 * (2 ** attempt))
+                continue
+            break
+
+        # If a multi-item chunk keeps hitting 503, split it into smaller batches to isolate problematic nodes
+        if last_status == 503 and len(chunk) > 1:
+            mid = len(chunk) // 2
+            left_ok = self._patch_album_chunk_with_retry(ap, album_id, chunk[:mid], retries=1)
+            time.sleep(0.25)
+            right_ok = self._patch_album_chunk_with_retry(ap, album_id, chunk[mid:], retries=1)
+            return left_ok and right_ok
+
+        logger.warning(f"  -> Batch add to Amazon album {album_id} failed (HTTP {last_status}): {last_body}")
+        return False
+
     def add_to_album(self, album_id: str, node_ids: List[str], cover_node_id: Optional[str] = None) -> bool:
-        """Add media nodes to an existing Amazon Photos album in batches."""
-        if not node_ids or not album_id:
+        """Add missing media nodes to an existing Amazon Photos album in resilient batches."""
+        clean_ids = [
+            nid for nid in (node_ids or [])
+            if nid and nid != "CONFLICT_EXISTING" and not str(nid).startswith("dry_run")
+        ]
+        if not clean_ids or not album_id or self.session_expired:
             return True
         ap = self._ensure_client()
         try:
-            # Amazon Drive API returns HTTP 503 if too many node IDs are patched in a single call
-            chunk_size = 20
+            existing_ids = self.get_album_children_ids(album_id)
+            if existing_ids is not None:
+                pending_ids = [nid for nid in clean_ids if nid not in existing_ids]
+            else:
+                pending_ids = clean_ids
+
+            if not pending_ids:
+                return True
+
+            # Deduplicate while preserving order
+            pending_ids = list(dict.fromkeys(pending_ids))
+            chunk_size = 15
             all_ok = True
-            for i in range(0, len(node_ids), chunk_size):
-                chunk = node_ids[i:i + chunk_size]
-                resp = ap.client.patch(
-                    f"{ap.drive_url}/nodes/{album_id}/children",
-                    json={
-                        "op": "add",
-                        "value": chunk,
-                        "resourceVersion": "V2",
-                        "ContentType": "JSON",
-                    },
-                    timeout=20
-                )
-                if resp.status_code not in (200, 202, 204):
-                    logger.warning(f"  -> Batch add to Amazon album {album_id} failed (HTTP {resp.status_code}): {resp.text[:120]}")
+            for i in range(0, len(pending_ids), chunk_size):
+                if self.session_expired:
                     all_ok = False
-                if i + chunk_size < len(node_ids):
-                    time.sleep(0.15)
-            cover = cover_node_id or (node_ids[0] if node_ids else None)
+                    break
+                chunk = pending_ids[i:i + chunk_size]
+                if not self._patch_album_chunk_with_retry(ap, album_id, chunk):
+                    all_ok = False
+                if i + chunk_size < len(pending_ids):
+                    time.sleep(0.3)
+
+            cover = cover_node_id or clean_ids[0]
             if cover:
                 self.set_album_cover(album_id, cover)
             return all_ok
