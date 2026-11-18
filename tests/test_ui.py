@@ -310,7 +310,8 @@ class TestUIDashboard(unittest.TestCase):
                 self.pause_event = pause_event
                 created_engines.append(self)
 
-            def run_sync_cycle(self):
+            def run_sync_cycle(self, limit_intake=None, force_deletes=False):
+                self.force_deletes = force_deletes
                 cycle_entered.set()
                 cycle_release.wait(timeout=3.0)
                 return {"immich_direct_synced": 0, "deletions_synced": 0, "albums_synced": 0}
@@ -447,6 +448,22 @@ class TestUIDashboard(unittest.TestCase):
             self.assertEqual(test_resp.status_code, 200)
             self.assertTrue(test_resp.json()["success"])
             mock_ap.add.assert_called_once_with("tgram://999888:SECRET_BOT/1234567")
+
+    def test_force_deletes_setting_persists(self):
+        resp = self.client.post("/api/sync/force-deletes", json={"enabled": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["force_deletes"])
+
+        status = self.client.get("/api/status").json()
+        self.assertTrue(status["force_deletes"])
+
+        cfg = self.client.get("/api/config").json()
+        self.assertTrue(cfg["sync"]["force_deletes"])
+
+        resp2 = self.client.post("/api/sync/force-deletes", json={"enabled": False})
+        self.assertEqual(resp2.status_code, 200)
+        self.assertFalse(resp2.json()["force_deletes"])
+        self.assertFalse(self.client.get("/api/status").json()["force_deletes"])
 
 
 if __name__ == "__main__":

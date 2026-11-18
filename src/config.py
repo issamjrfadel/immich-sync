@@ -33,6 +33,7 @@ class SyncSettings(BaseModel):
     sync_videos_to_amazon: bool = Field(False, description="Whether to upload video files to Amazon Photos (False: photos/pictures only)")
     sync_videos_to_icloud: bool = Field(True, description="Whether to upload video files from Immich to iCloud Photos")
     max_delete_limit: int = Field(50, description="Safety guard: halt if more than X files would be deleted in one pass")
+    force_deletes: bool = Field(False, description="Bypass max_delete_limit safety guard during deletion sync")
     download_temp_dir: str = Field("./.temp", description="Temporary staging directory for in-flight image downloads")
     poll_interval_seconds: int = Field(300, description="Polling interval in seconds for continuous daemon mode")
     dry_run: bool = Field(False, description="Preview actions without making destructive or write operations")
@@ -126,6 +127,7 @@ def apply_env_overrides(data: Dict[str, Any], env: Dict[str, str]) -> Tuple[Dict
         ("SYNC_DELETIONS", sync, "sync_deletions", _parse_bool),
         ("SYNC_ALBUMS", sync, "sync_albums", _parse_bool),
         ("IGNORE_HIDDEN_AND_LOCKED", sync, "ignore_hidden_and_locked", _parse_bool),
+        ("FORCE_DELETES", sync, "force_deletes", _parse_bool),
         ("DRY_RUN", sync, "dry_run", _parse_bool),
         ("NOTIFICATIONS_ENABLED", notifications, "enabled", _parse_bool),
         ("DAILY_SUMMARY_HOUR", notifications, "daily_summary_hour", int),

@@ -256,7 +256,7 @@
             <span class="text-slate-300">Dry Run (Simulate only)</span>
           </label>
           <label class="flex items-center space-x-2 cursor-pointer select-none">
-            <input type="checkbox" id="optForceDeletes" class="rounded border-darkborder text-brand-500 focus:ring-brand-500 bg-slate-900 w-4 h-4">
+            <input type="checkbox" id="optForceDeletes" onchange="toggleForceDeletes(this.checked)" class="rounded border-darkborder text-brand-500 focus:ring-brand-500 bg-slate-900 w-4 h-4">
             <span class="text-slate-300">Force Deletions (Bypass limit)</span>
           </label>
         </div>
@@ -630,6 +630,10 @@
               <label class="block text-slate-400 mb-1 font-medium">Max Delete Safety Threshold</label>
               <input type="number" id="cfg_sync_max_deletes" value="50" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none">
               <span class="text-[11px] text-slate-500 mt-1 block">Halts sync if deletions exceed this count in one cycle.</span>
+              <label class="flex items-center space-x-2 cursor-pointer select-none mt-2">
+                <input type="checkbox" id="cfg_sync_force_deletes" class="rounded border-darkborder text-brand-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                <span class="text-slate-300">Force Deletions (Bypass limit)</span>
+              </label>
             </div>
             <div>
               <label class="block text-slate-400 mb-1 font-medium">Daemon Polling Interval (seconds)</label>
@@ -985,6 +989,10 @@
         if (data.progress) {
           updateProgressUI(data.progress);
         }
+        if (data.force_deletes !== undefined) {
+          const forceEl = document.getElementById('optForceDeletes');
+          if (forceEl) forceEl.checked = !!data.force_deletes;
+        }
         const oneWayBadge = document.getElementById('oneWayBadge');
         if (oneWayBadge) {
           if (data.one_way_immich_master !== false) {
@@ -1064,6 +1072,27 @@
           updateStatus();
         } else {
           showToast(data.detail || 'Failed to toggle host', 'error');
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      }
+    }
+
+    // Persist Force Deletions checkbox toggle immediately
+    async function toggleForceDeletes(enabled) {
+      try {
+        const res = await fetch('/api/sync/force-deletes', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ enabled: !!enabled })
+        });
+        const data = await res.json();
+        if (res.ok && data.success) {
+          const cfgForceEl = document.getElementById('cfg_sync_force_deletes');
+          if (cfgForceEl) cfgForceEl.checked = !!enabled;
+          showToast(enabled ? 'Force Deletions enabled & saved' : 'Force Deletions disabled & saved', 'success');
+        } else {
+          showToast(data.detail || 'Failed to save Force Deletions', 'error');
         }
       } catch (err) {
         showToast(err.message, 'error');
@@ -1416,6 +1445,10 @@
         if (ignoreHiddenEl) ignoreHiddenEl.checked = cfg.sync?.ignore_hidden_and_locked !== false;
 
         document.getElementById('cfg_sync_max_deletes').value = cfg.sync?.max_delete_limit || 50;
+        const cfgForceEl = document.getElementById('cfg_sync_force_deletes');
+        if (cfgForceEl) cfgForceEl.checked = cfg.sync?.force_deletes === true;
+        const optForceEl = document.getElementById('optForceDeletes');
+        if (optForceEl) optForceEl.checked = cfg.sync?.force_deletes === true;
         document.getElementById('cfg_sync_poll_interval').value = cfg.sync?.poll_interval_seconds || 300;
         document.getElementById('cfg_sync_temp_dir').value = cfg.sync?.download_temp_dir || './.temp';
 
@@ -1501,6 +1534,7 @@
           sync_deletions: true,
           sync_albums: true,
           max_delete_limit: isNaN(maxDeletes) ? 50 : maxDeletes,
+          force_deletes: document.getElementById('cfg_sync_force_deletes')?.checked ?? document.getElementById('optForceDeletes')?.checked ?? false,
           download_temp_dir: document.getElementById('cfg_sync_temp_dir')?.value.trim() || './.temp',
           poll_interval_seconds: isNaN(pollInterval) ? 300 : pollInterval,
           dry_run: false,

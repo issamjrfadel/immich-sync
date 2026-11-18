@@ -253,11 +253,14 @@ def sync_test_service(service: str, payload: Optional[dict], cfg: Optional[AppCo
 
 class SyncRunRequest(BaseModel):
     dry_run: bool = False
-    force_deletes: bool = False
+    force_deletes: Optional[bool] = None
     limit: Optional[int] = None
     enable_immich: Optional[bool] = None
     enable_icloud: Optional[bool] = None
     enable_amazon: Optional[bool] = None
+
+class ForceDeletesRequest(BaseModel):
+    enabled: bool
 
 class ToggleHostRequest(BaseModel):
     service: str
@@ -447,9 +450,18 @@ def create_app(
             "services": service_status_cache,
             "progress": sync_progress,
             "one_way_immich_master": getattr(cfg.sync, "one_way_immich_master", True) if cfg else True,
+            "force_deletes": getattr(cfg.sync, "force_deletes", False) if cfg else False,
             "storage_warning": app.state.storage_warning,
             "config_path": str(Path(config_path).resolve()),
         }
+
+    @app.post("/api/sync/force-deletes")
+    async def toggle_force_deletes(req: ForceDeletesRequest):
+        cfg = _get_or_init_cfg()
+        cfg.sync.force_deletes = req.enabled
+        save_config(cfg, config_path)
+        logger.info(f"Force Deletions setting saved: {req.enabled}")
+        return {"success": True, "force_deletes": req.enabled}
 
     @app.get("/api/sync/progress")
     async def get_sync_progress():
@@ -725,7 +737,8 @@ def create_app(
                     stop_event=sync_state["stop_sync_event"],
                     pause_event=sync_state["pause_sync_event"]
                 )
-                stats = engine.run_sync_cycle(limit_intake=req.limit, force_deletes=req.force_deletes)
+                effective_force_deletes = req.force_deletes if req.force_deletes is not None else sync_cfg.sync.force_deletes
+                stats = engine.run_sync_cycle(limit_intake=req.limit, force_deletes=effective_force_deletes)
                 sync_state["last_stats"] = stats
                 sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 _record_cycle_and_notify(sync_cfg, stats)
@@ -794,7 +807,7 @@ def create_app(
                             stop_event=sync_state["stop_sync_event"],
                             pause_event=sync_state["pause_sync_event"],
                         )
-                        stats = engine.run_sync_cycle()
+                        stats = engine.run_sync_cycle(force_deletes=active_cfg.sync.force_deletes)
                         sync_state["last_stats"] = stats
                         sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
                         _record_cycle_and_notify(active_cfg, stats)
