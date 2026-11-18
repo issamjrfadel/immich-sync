@@ -56,6 +56,23 @@ class SyncDatabase:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS daily_scan_stats (
+                    scan_date TEXT PRIMARY KEY,
+                    scans_count INTEGER DEFAULT 0,
+                    immich_direct_synced INTEGER DEFAULT 0,
+                    amazon_uploaded INTEGER DEFAULT 0,
+                    icloud_uploaded INTEGER DEFAULT 0,
+                    icloud_ingested INTEGER DEFAULT 0,
+                    immich_uploaded INTEGER DEFAULT 0,
+                    deletions_synced INTEGER DEFAULT 0,
+                    albums_synced INTEGER DEFAULT 0,
+                    errors INTEGER DEFAULT 0,
+                    last_scan_at TIMESTAMP,
+                    notified_at TIMESTAMP
+                )
+            """)
+
             # Indexes
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_assets_sha1 ON assets(sha1)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_assets_immich ON assets(immich_id)")
@@ -189,4 +206,84 @@ class SyncDatabase:
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("INSERT INTO sync_history (action, details) VALUES (?, ?)", (action, details))
+            conn.commit()
+
+    @staticmethod
+    def _today_key(scan_date: Optional[str] = None) -> str:
+        return scan_date or datetime.date.today().isoformat()
+
+    def record_scan_stats(self, stats: Dict[str, Any], scan_date: Optional[str] = None):
+        date_key = self._today_key(scan_date)
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO daily_scan_stats (
+                    scan_date, scans_count, immich_direct_synced, amazon_uploaded,
+                    icloud_uploaded, icloud_ingested, immich_uploaded,
+                    deletions_synced, albums_synced, errors, last_scan_at
+                )
+                VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(scan_date) DO UPDATE SET
+                    scans_count = daily_scan_stats.scans_count + 1,
+                    immich_direct_synced = daily_scan_stats.immich_direct_synced + excluded.immich_direct_synced,
+                    amazon_uploaded = daily_scan_stats.amazon_uploaded + excluded.amazon_uploaded,
+                    icloud_uploaded = daily_scan_stats.icloud_uploaded + excluded.icloud_uploaded,
+                    icloud_ingested = daily_scan_stats.icloud_ingested + excluded.icloud_ingested,
+                    immich_uploaded = daily_scan_stats.immich_uploaded + excluded.immich_uploaded,
+                    deletions_synced = daily_scan_stats.deletions_synced + excluded.deletions_synced,
+                    albums_synced = daily_scan_stats.albums_synced + excluded.albums_synced,
+                    errors = daily_scan_stats.errors + excluded.errors,
+                    last_scan_at = excluded.last_scan_at
+            """, (
+                date_key,
+                int(stats.get("immich_direct_synced", 0) or 0),
+                int(stats.get("amazon_uploaded", 0) or 0),
+                int(stats.get("icloud_uploaded", 0) or 0),
+                int(stats.get("icloud_ingested", 0) or 0),
+                int(stats.get("immich_uploaded", 0) or 0),
+                int(stats.get("deletions_synced", 0) or 0),
+                int(stats.get("albums_synced", 0) or 0),
+                int(stats.get("errors", 0) or 0),
+                now,
+            ))
+            conn.commit()
+
+    def get_daily_scan_stats(self, scan_date: Optional[str] = None) -> Dict[str, Any]:
+        date_key = self._today_key(scan_date)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM daily_scan_stats WHERE scan_date = ?", (date_key,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+        return {
+            "scan_date": date_key,
+            "scans_count": 0,
+            "immich_direct_synced": 0,
+            "amazon_uploaded": 0,
+            "icloud_uploaded": 0,
+            "icloud_ingested": 0,
+            "immich_uploaded": 0,
+            "deletions_synced": 0,
+            "albums_synced": 0,
+            "errors": 0,
+            "last_scan_at": None,
+            "notified_at": None,
+        }
+
+    def was_daily_notified(self, scan_date: Optional[str] = None) -> bool:
+        row = self.get_daily_scan_stats(scan_date)
+        return bool(row.get("notified_at"))
+
+    def mark_daily_notified(self, scan_date: Optional[str] = None):
+        date_key = self._today_key(scan_date)
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO daily_scan_stats (scan_date, notified_at)
+                VALUES (?, ?)
+                ON CONFLICT(scan_date) DO UPDATE SET notified_at = excluded.notified_at
+            """, (date_key, now))
             conn.commit()

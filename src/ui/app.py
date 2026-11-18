@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from src.config import load_config, save_config, AppConfig
 from src.database import SyncDatabase
 from src.engine import SyncEngine
+from src.notifications import maybe_send_daily_summary, maybe_send_error_alert, send_test_notification
 from src.clients.immich import ImmichClient
 from src.clients.icloud import ICloudClient
 from src.clients.amazon import AmazonPhotosClient
@@ -143,6 +144,9 @@ def _mask_config_dict(data: dict) -> dict:
         for k, v in list(cookies.items()):
             if v and _is_secret_cookie_key(k):
                 cookies[k] = SECRET_MASK
+    apprise_urls = masked.get("notifications", {}).get("apprise_urls")
+    if isinstance(apprise_urls, list) and apprise_urls:
+        masked["notifications"]["apprise_urls"] = [SECRET_MASK for u in apprise_urls if u]
     return masked
 
 def sync_test_service(service: str, payload: Optional[dict], cfg: Optional[AppConfig]) -> dict:
@@ -657,6 +661,17 @@ def create_app(
         logger.info("Sync cycle stopped by user via Web UI.")
         return {"status": "stopping", "message": "Stopping active sync cycle..."}
 
+    def _record_cycle_and_notify(cycle_cfg: AppConfig, stats: Dict[str, Any]) -> None:
+        if getattr(cycle_cfg.sync, "dry_run", False):
+            return
+        try:
+            db = SyncDatabase(db_path)
+            db.record_scan_stats(stats)
+            maybe_send_error_alert(cycle_cfg, stats)
+            maybe_send_daily_summary(cycle_cfg, db)
+        except Exception as e:
+            logger.warning(f"Failed recording daily scan stats / notifications: {e}")
+
     @app.post("/api/sync/run")
     async def trigger_sync(req: SyncRunRequest):
         if sync_state["is_syncing"]:
@@ -705,6 +720,7 @@ def create_app(
                 stats = engine.run_sync_cycle(limit_intake=req.limit, force_deletes=req.force_deletes)
                 sync_state["last_stats"] = stats
                 sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                _record_cycle_and_notify(sync_cfg, stats)
             except Exception as e:
                 logger.error(f"Manual sync failed: {e}", exc_info=True)
                 handle_sync_progress({
@@ -773,6 +789,7 @@ def create_app(
                         stats = engine.run_sync_cycle()
                         sync_state["last_stats"] = stats
                         sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                        _record_cycle_and_notify(active_cfg, stats)
                     except Exception as e:
                         logger.error(f"Daemon cycle error: {e}")
                     finally:
@@ -793,9 +810,15 @@ def create_app(
                                 )
 
                 # Sleep in short increments to respond quickly to stop requests
-                for _ in range(interval):
+                for sec in range(interval):
                     if sync_state["stop_daemon_event"].is_set():
                         break
+                    if sec > 0 and sec % 60 == 0:
+                        try:
+                            latest_cfg = get_cfg() or active_cfg
+                            maybe_send_daily_summary(latest_cfg, SyncDatabase(db_path))
+                        except Exception as e:
+                            logger.debug(f"Periodic daily notification check failed: {e}")
                     time.sleep(1)
 
             logger.info("Sync daemon stopped.")
@@ -882,6 +905,21 @@ def create_app(
                             merged_cookies.pop(k, None)
                     amz["cookies"] = merged_cookies
 
+                notif = merged_payload.setdefault("notifications", {})
+                if "apprise_urls" in notif and isinstance(notif["apprise_urls"], list):
+                    raw_urls = [str(u).strip() for u in notif["apprise_urls"] if str(u).strip()]
+                    existing_urls = list(existing_cfg.notifications.apprise_urls or [])
+                    if raw_urls and all(u == SECRET_MASK for u in raw_urls) and existing_urls:
+                        notif["apprise_urls"] = existing_urls
+                    else:
+                        resolved_urls: List[str] = []
+                        for idx, u in enumerate(raw_urls):
+                            if u == SECRET_MASK and idx < len(existing_urls):
+                                resolved_urls.append(existing_urls[idx])
+                            elif u != SECRET_MASK:
+                                resolved_urls.append(u)
+                        notif["apprise_urls"] = resolved_urls
+
             validated = AppConfig.model_validate(merged_payload)
             save_config(validated, config_path)
             # Update cache flags
@@ -904,6 +942,29 @@ def create_app(
         cfg = get_cfg()
         result = await asyncio.to_thread(sync_test_service, service, payload, cfg)
         return result
+
+    @app.post("/api/notifications/test")
+    async def test_notifications_endpoint(payload: Optional[dict] = None):
+        cfg = get_cfg()
+        raw_urls = payload.get("apprise_urls") if isinstance(payload, dict) else None
+        urls: List[str] = []
+        if isinstance(raw_urls, list):
+            cleaned = [str(u).strip() for u in raw_urls if str(u).strip()]
+            existing_urls = list(cfg.notifications.apprise_urls or []) if cfg else []
+            if cleaned and all(u == SECRET_MASK for u in cleaned) and existing_urls:
+                urls = existing_urls
+            else:
+                for idx, u in enumerate(cleaned):
+                    if u == SECRET_MASK and idx < len(existing_urls):
+                        urls.append(existing_urls[idx])
+                    elif u != SECRET_MASK:
+                        urls.append(u)
+        elif cfg:
+            urls = list(cfg.notifications.apprise_urls)
+
+        db = SyncDatabase(db_path)
+        ok, msg = await asyncio.to_thread(send_test_notification, urls, db)
+        return {"success": ok, "message": msg}
 
     @app.post("/api/icloud/2fa/start")
     async def start_icloud_2fa(payload: Optional[dict] = None):

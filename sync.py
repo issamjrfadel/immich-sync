@@ -10,6 +10,7 @@ from rich.panel import Panel
 from src.config import load_config, AppConfig
 from src.engine import SyncEngine
 from src.database import SyncDatabase
+from src.notifications import maybe_send_daily_summary, maybe_send_error_alert
 from src.clients.immich import ImmichClient
 from src.clients.icloud import ICloudClient
 from src.clients.amazon import AmazonPhotosClient
@@ -43,6 +44,11 @@ def run(config: str, limit: int, force_deletes: bool, dry_run: bool, verbose: bo
         engine = SyncEngine(cfg)
         console.print(Panel.fit("[bold cyan]Starting Sync Cycle[/bold cyan]", border_style="cyan"))
         stats = engine.run_sync_cycle(limit_intake=limit, force_deletes=force_deletes)
+        if not cfg.sync.dry_run:
+            db_inst = SyncDatabase()
+            db_inst.record_scan_stats(stats)
+            maybe_send_error_alert(cfg, stats)
+            maybe_send_daily_summary(cfg, db_inst)
 
         table = Table(title="Sync Results Summary", show_header=True, header_style="bold magenta")
         table.add_column("Metric", style="dim")
@@ -88,7 +94,12 @@ def daemon(config: str, interval: int, force_deletes: bool, verbose: bool):
     try:
         while True:
             try:
-                engine.run_sync_cycle(force_deletes=force_deletes)
+                stats = engine.run_sync_cycle(force_deletes=force_deletes)
+                if not cfg.sync.dry_run:
+                    db_inst = SyncDatabase()
+                    db_inst.record_scan_stats(stats)
+                    maybe_send_error_alert(cfg, stats)
+                    maybe_send_daily_summary(cfg, db_inst)
             except Exception as e:
                 console.print(f"[bold red]Cycle Error:[/bold red] {e}")
 

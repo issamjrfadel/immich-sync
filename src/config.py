@@ -1,7 +1,7 @@
 import os
 import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, List
 from dotenv import dotenv_values
 from pydantic import BaseModel, Field
 
@@ -40,11 +40,19 @@ class SyncSettings(BaseModel):
     enable_icloud: bool = Field(True, description="Enable iCloud as a sync source/destination")
     enable_amazon: bool = Field(True, description="Enable Amazon Photos as a sync destination")
 
+class NotificationConfig(BaseModel):
+    enabled: bool = Field(False, description="Enable daily scan summary notifications via Apprise")
+    apprise_urls: List[str] = Field(default_factory=list, description="Apprise URLs (e.g. tgram://<bot_token>/<chat_id>)")
+    daily_summary_hour: int = Field(21, ge=0, le=23, description="Local hour (0-23) when the daily scan summary is sent")
+    notify_on_error: bool = Field(False, description="Send an immediate notification when a scan cycle encounters errors")
+
+
 class AppConfig(BaseModel):
     immich: ImmichConfig
     icloud: ICloudConfig
     amazon: AmazonConfig
     sync: SyncSettings = Field(default_factory=SyncSettings)
+    notifications: NotificationConfig = Field(default_factory=NotificationConfig)
 
 _ENV_BOOTSTRAP_KEYS = (
     "IMMICH_URL",
@@ -95,6 +103,7 @@ def apply_env_overrides(data: Dict[str, Any], env: Dict[str, str]) -> Tuple[Dict
     amazon = data.setdefault("amazon", {})
     cookies = amazon.setdefault("cookies", {})
     sync = data.setdefault("sync", {})
+    notifications = data.setdefault("notifications", {})
     applied = False
 
     def get_val(key: str) -> Optional[str]:
@@ -118,6 +127,9 @@ def apply_env_overrides(data: Dict[str, Any], env: Dict[str, str]) -> Tuple[Dict
         ("SYNC_ALBUMS", sync, "sync_albums", _parse_bool),
         ("IGNORE_HIDDEN_AND_LOCKED", sync, "ignore_hidden_and_locked", _parse_bool),
         ("DRY_RUN", sync, "dry_run", _parse_bool),
+        ("NOTIFICATIONS_ENABLED", notifications, "enabled", _parse_bool),
+        ("DAILY_SUMMARY_HOUR", notifications, "daily_summary_hour", int),
+        ("NOTIFY_ON_ERROR", notifications, "notify_on_error", _parse_bool),
     ]
     for env_key, section, field_name, parser in field_mappings:
         raw = get_val(env_key)
@@ -164,6 +176,28 @@ def apply_env_overrides(data: Dict[str, Any], env: Dict[str, str]) -> Tuple[Dict
             cookies[cookie_name] = raw
             applied = True
 
+    # Apprise / Telegram notification URLs
+    raw_apprise = get_val("APPRISE_URLS")
+    if raw_apprise is not None:
+        parsed_urls = [u.strip() for u in raw_apprise.replace(",", "\n").splitlines() if u.strip()]
+        if parsed_urls:
+            notifications["apprise_urls"] = parsed_urls
+            if get_val("NOTIFICATIONS_ENABLED") is None:
+                notifications["enabled"] = True
+            applied = True
+
+    tg_token = get_val("TELEGRAM_BOT_TOKEN")
+    tg_chat = get_val("TELEGRAM_CHAT_ID")
+    if tg_token and tg_chat:
+        tgram_url = f"tgram://{tg_token}/{tg_chat}"
+        existing_urls = list(notifications.get("apprise_urls") or [])
+        if tgram_url not in existing_urls:
+            existing_urls.append(tgram_url)
+        notifications["apprise_urls"] = existing_urls
+        if get_val("NOTIFICATIONS_ENABLED") is None:
+            notifications["enabled"] = True
+        applied = True
+
     return data, applied
 
 
@@ -191,7 +225,8 @@ def load_config(config_path: str | Path = "config.json") -> AppConfig:
 
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-    apply_env_overrides(data, env)
+    if env.get("ENV_OVERRIDE", "").strip().lower() in ("1", "true", "yes", "on"):
+        apply_env_overrides(data, env)
     return AppConfig.model_validate(data)
 
 

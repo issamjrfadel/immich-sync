@@ -588,9 +588,26 @@ class TestSyncComponents(unittest.TestCase):
         self.assertEqual(bootstrapped.amazon.cookies["at-acbca"], "Atza|env-token-3")
         self.assertEqual(bootstrapped.sync.poll_interval_seconds, 180)
 
-        # 2. Override existing config.json values via updated .env without wiping untouched fields
+        # 2. Once config.json exists, Web UI / config.json edits are NOT overwritten by .env unless ENV_OVERRIDE=true
         env_file.write_text(
             "\n".join([
+                "IMMICH_URL=http://192.168.1.99:2283",
+                "IMMICH_API_KEY=",
+                "POLL_INTERVAL_SECONDS=600",
+                "ICLOUD_UPLOAD_VIDEOS=true",
+            ]),
+            encoding="utf-8",
+        )
+        preserved = load_config(cfg_file)
+        self.assertEqual(preserved.immich.url, "http://192.168.1.50:2283")
+        self.assertEqual(preserved.immich.api_key, "env-api-key")
+        self.assertEqual(preserved.sync.poll_interval_seconds, 180)
+        self.assertFalse(preserved.icloud.upload_videos)
+
+        # 3. With ENV_OVERRIDE=true explicitly set, .env overrides existing config.json
+        env_file.write_text(
+            "\n".join([
+                "ENV_OVERRIDE=true",
                 "IMMICH_URL=http://192.168.1.99:2283",
                 "IMMICH_API_KEY=",
                 "POLL_INTERVAL_SECONDS=600",
@@ -686,6 +703,87 @@ class TestSyncComponents(unittest.TestCase):
         engine.immich.download_asset.assert_not_called()
         engine.amazon.find_nodes_by_md5.assert_not_called()
         engine.amazon.trash_nodes.assert_not_called()
+
+    def test_daily_scan_stats_and_apprise_telegram_notification(self):
+        import datetime
+        from src.config import NotificationConfig
+        from src.notifications import maybe_send_daily_summary
+
+        # Accumulate multiple scans for the same day
+        self.db.record_scan_stats(
+            {"immich_direct_synced": 3, "amazon_uploaded": 2, "icloud_uploaded": 1, "deletions_synced": 1, "albums_synced": 2, "errors": 0},
+            scan_date="2026-11-17",
+        )
+        self.db.record_scan_stats(
+            {"immich_direct_synced": 4, "amazon_uploaded": 4, "icloud_uploaded": 3, "deletions_synced": 0, "albums_synced": 1, "errors": 1},
+            scan_date="2026-11-17",
+        )
+
+        daily = self.db.get_daily_scan_stats("2026-11-17")
+        self.assertEqual(daily["scans_count"], 2)
+        self.assertEqual(daily["immich_direct_synced"], 7)
+        self.assertEqual(daily["amazon_uploaded"], 6)
+        self.assertEqual(daily["icloud_uploaded"], 4)
+        self.assertEqual(daily["deletions_synced"], 1)
+        self.assertEqual(daily["albums_synced"], 3)
+        self.assertEqual(daily["errors"], 1)
+
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="dummy"),
+            icloud=ICloudConfig(apple_id="user@icloud.com"),
+            amazon=AmazonConfig(cookies={"session-id": "test"}),
+            notifications=NotificationConfig(
+                enabled=True,
+                apprise_urls=["tgram://123456:ABC-DEF/987654321"],
+                daily_summary_hour=21,
+            ),
+        )
+
+        with patch("apprise.Apprise") as mock_apprise_cls:
+            mock_ap = MagicMock()
+            mock_ap.add.return_value = True
+            mock_ap.__len__.return_value = 1
+            mock_ap.notify.return_value = True
+            mock_apprise_cls.return_value = mock_ap
+
+            # Before 21:00 -> should not send yet
+            early = datetime.datetime(2026, 11, 17, 20, 45)
+            self.assertFalse(maybe_send_daily_summary(cfg, self.db, now=early))
+            mock_ap.notify.assert_not_called()
+
+            # At 21:05 -> sends once with accumulated daily stats
+            due = datetime.datetime(2026, 11, 17, 21, 5)
+            self.assertTrue(maybe_send_daily_summary(cfg, self.db, now=due))
+            mock_ap.add.assert_called_once_with("tgram://123456:ABC-DEF/987654321")
+            mock_ap.notify.assert_called_once()
+            kwargs = mock_ap.notify.call_args.kwargs
+            self.assertIn("2026-11-17", kwargs["title"])
+            self.assertIn("Scans Completed Today: 2", kwargs["body"])
+            self.assertIn("Uploaded to Amazon Photos: 6", kwargs["body"])
+            self.assertIn("Uploaded to iCloud Photos: 4", kwargs["body"])
+
+            # Later same day -> already notified, does not re-send
+            later = datetime.datetime(2026, 11, 17, 22, 10)
+            self.assertFalse(maybe_send_daily_summary(cfg, self.db, now=later))
+            self.assertEqual(mock_ap.notify.call_count, 1)
+
+    def test_telegram_env_variables_configure_apprise(self):
+        cfg_file = Path(self.temp_dir.name) / "config.json"
+        env_file = Path(self.temp_dir.name) / ".env"
+        env_file.write_text(
+            "\n".join([
+                "IMMICH_URL=http://192.168.1.50:2283",
+                "IMMICH_API_KEY=env-api-key",
+                "TELEGRAM_BOT_TOKEN=111222:TOKEN",
+                "TELEGRAM_CHAT_ID=555666777",
+                "DAILY_SUMMARY_HOUR=20",
+            ]),
+            encoding="utf-8",
+        )
+        loaded = load_config(cfg_file)
+        self.assertTrue(loaded.notifications.enabled)
+        self.assertEqual(loaded.notifications.apprise_urls, ["tgram://111222:TOKEN/555666777"])
+        self.assertEqual(loaded.notifications.daily_summary_hour, 20)
 
 
 if __name__ == "__main__":

@@ -645,6 +645,68 @@
           </div>
         </div>
 
+        <!-- NOTIFICATIONS (APPRISE / TELEGRAM) -->
+        <div class="bg-darkcard border border-darkborder rounded-2xl p-6 space-y-4 lg:col-span-3">
+          <div class="flex items-center justify-between">
+            <h3 class="font-bold text-base flex items-center gap-2 text-sky-400">
+              <i class="fa-brands fa-telegram"></i> Notifications (Apprise / Telegram)
+            </h3>
+            <label class="flex items-center space-x-2 cursor-pointer text-xs">
+              <input type="checkbox" id="cfg_notifications_enabled" class="rounded border-darkborder text-sky-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+              <span class="text-slate-200 font-medium">Enable Daily Summary</span>
+            </label>
+          </div>
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-5 text-xs">
+            <div class="md:col-span-2 space-y-1.5">
+              <label class="block text-slate-400 font-medium">Apprise URL(s)</label>
+              <textarea id="cfg_notifications_urls" rows="2" placeholder="tgram://BOT_TOKEN/CHAT_ID" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-sky-500 focus:outline-none font-mono"></textarea>
+              <span class="text-[11px] text-slate-500 block">One Apprise URL per line. For Telegram use <code class="bg-slate-800 text-sky-300 px-1 rounded">tgram://BOT_TOKEN/CHAT_ID</code>. Stored URLs display masked (<code class="text-slate-400">********</code>).</span>
+            </div>
+            <div class="space-y-3">
+              <div>
+                <label class="block text-slate-400 mb-1 font-medium">Daily Summary Hour (24h local TZ)</label>
+                <select id="cfg_notifications_hour" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-sky-500 focus:outline-none">
+                  <option value="0">00:00 (12:00 AM)</option>
+                  <option value="1">01:00 (1:00 AM)</option>
+                  <option value="2">02:00 (2:00 AM)</option>
+                  <option value="3">03:00 (3:00 AM)</option>
+                  <option value="4">04:00 (4:00 AM)</option>
+                  <option value="5">05:00 (5:00 AM)</option>
+                  <option value="6">06:00 (6:00 AM)</option>
+                  <option value="7">07:00 (7:00 AM)</option>
+                  <option value="8">08:00 (8:00 AM)</option>
+                  <option value="9">09:00 (9:00 AM)</option>
+                  <option value="10">10:00 (10:00 AM)</option>
+                  <option value="11">11:00 (11:00 AM)</option>
+                  <option value="12">12:00 (12:00 PM)</option>
+                  <option value="13">13:00 (1:00 PM)</option>
+                  <option value="14">14:00 (2:00 PM)</option>
+                  <option value="15">15:00 (3:00 PM)</option>
+                  <option value="16">16:00 (4:00 PM)</option>
+                  <option value="17">17:00 (5:00 PM)</option>
+                  <option value="18">18:00 (6:00 PM)</option>
+                  <option value="19">19:00 (7:00 PM)</option>
+                  <option value="20">20:00 (8:00 PM)</option>
+                  <option value="21" selected>21:00 (9:00 PM)</option>
+                  <option value="22">22:00 (10:00 PM)</option>
+                  <option value="23">23:00 (11:00 PM)</option>
+                </select>
+              </div>
+              <label class="flex items-center space-x-2 cursor-pointer select-none">
+                <input type="checkbox" id="cfg_notifications_on_error" class="rounded border-darkborder text-rose-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
+                <span class="text-slate-300">Immediate Alert on Scan Errors</span>
+              </label>
+              <div class="pt-1 flex items-center justify-end">
+                <button type="button" onclick="testNotifications()" id="btnTestNotifications" class="text-xs bg-sky-600/30 hover:bg-sky-600/40 text-sky-300 border border-sky-500/40 px-3 py-1.5 rounded-lg font-medium flex items-center space-x-1.5 transition-colors">
+                  <i class="fa-solid fa-paper-plane"></i>
+                  <span>Send Test Notification</span>
+                </button>
+              </div>
+            </div>
+          </div>
+          <div id="notificationsTestResult" class="hidden text-xs p-2.5 rounded-lg font-medium"></div>
+        </div>
+
       </div>
     </div>
 
@@ -1174,6 +1236,52 @@
       }
     }
 
+    async function testNotifications() {
+      const btn = document.getElementById('btnTestNotifications');
+      const resultDiv = document.getElementById('notificationsTestResult');
+      const rawUrlsText = document.getElementById('cfg_notifications_urls')?.value || '';
+      const appriseUrls = rawUrlsText.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> <span>Sending...</span>`;
+      }
+      if (resultDiv) {
+        resultDiv.className = "text-xs p-2.5 rounded-lg font-medium bg-slate-800 border border-slate-700 text-slate-300 flex items-center gap-2";
+        resultDiv.innerHTML = `<i class="fa-solid fa-spinner animate-spin"></i> <span>Sending test notification...</span>`;
+        resultDiv.classList.remove('hidden');
+      }
+
+      try {
+        const res = await fetch('/api/notifications/test', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ apprise_urls: appriseUrls })
+        });
+        const data = await res.json();
+        if (data.success) {
+          showToast(data.message || 'Test notification sent!', 'success');
+          if (resultDiv) {
+            resultDiv.className = "text-xs p-2.5 rounded-lg font-medium bg-emerald-950/80 border border-emerald-500/40 text-emerald-300 flex items-center gap-2";
+            resultDiv.innerHTML = `<i class="fa-solid fa-circle-check text-emerald-400"></i> <span>${escapeHtml(data.message)}</span>`;
+          }
+        } else {
+          showToast(data.message || 'Notification failed', 'error');
+          if (resultDiv) {
+            resultDiv.className = "text-xs p-2.5 rounded-lg font-medium bg-rose-950/80 border border-rose-500/40 text-rose-300 flex items-center gap-2";
+            resultDiv.innerHTML = `<i class="fa-solid fa-triangle-exclamation text-rose-400"></i> <span>${escapeHtml(data.message)}</span>`;
+          }
+        }
+      } catch (err) {
+        showToast(err.message, 'error');
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = `<i class="fa-solid fa-paper-plane"></i> <span>Send Test Notification</span>`;
+        }
+      }
+    }
+
     // 2FA Modal Handlers
     async function open2FAModal() {
       document.getElementById('modal2FA').classList.remove('hidden');
@@ -1311,6 +1419,15 @@
         document.getElementById('cfg_sync_max_deletes').value = cfg.sync?.max_delete_limit || 50;
         document.getElementById('cfg_sync_poll_interval').value = cfg.sync?.poll_interval_seconds || 300;
         document.getElementById('cfg_sync_temp_dir').value = cfg.sync?.download_temp_dir || './.temp';
+
+        const notifEnabledEl = document.getElementById('cfg_notifications_enabled');
+        if (notifEnabledEl) notifEnabledEl.checked = cfg.notifications?.enabled === true;
+        const notifUrlsEl = document.getElementById('cfg_notifications_urls');
+        if (notifUrlsEl) notifUrlsEl.value = (cfg.notifications?.apprise_urls || []).join('\n');
+        const notifHourEl = document.getElementById('cfg_notifications_hour');
+        if (notifHourEl) notifHourEl.value = String(cfg.notifications?.daily_summary_hour ?? 21);
+        const notifErrEl = document.getElementById('cfg_notifications_on_error');
+        if (notifErrEl) notifErrEl.checked = cfg.notifications?.notify_on_error === true;
       } catch (err) {
         console.error('Failed to load config', err);
       }
@@ -1352,6 +1469,10 @@
         amazonCookies[`at-acb${amazonTld}`] = amazonAt;
       }
 
+      const rawNotifUrls = document.getElementById('cfg_notifications_urls')?.value || '';
+      const notifUrls = rawNotifUrls.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
+      const notifHour = parseInt(document.getElementById('cfg_notifications_hour')?.value, 10);
+
       const payload = {
         immich: {
           url: document.getElementById('cfg_immich_url')?.value.trim() || "http://localhost:2283",
@@ -1387,6 +1508,12 @@
           enable_immich: immichEnabled,
           enable_icloud: icloudEnabled,
           enable_amazon: amazonEnabled
+        },
+        notifications: {
+          enabled: document.getElementById('cfg_notifications_enabled')?.checked ?? false,
+          apprise_urls: notifUrls,
+          daily_summary_hour: isNaN(notifHour) ? 21 : notifHour,
+          notify_on_error: document.getElementById('cfg_notifications_on_error')?.checked ?? false
         }
       };
 

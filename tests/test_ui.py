@@ -405,6 +405,45 @@ class TestUIDashboard(unittest.TestCase):
         )
         self.assertEqual(get_storage_warning(data_dir, mountinfo, dockerenv), "")
 
+    def test_notifications_masking_preservation_and_test_endpoint(self):
+        from unittest.mock import MagicMock, patch
+
+        cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        cfg["notifications"] = {
+            "enabled": True,
+            "apprise_urls": ["tgram://999888:SECRET_BOT/1234567"],
+            "daily_summary_hour": 21,
+            "notify_on_error": False,
+        }
+        self.cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        # 1. GET /api/config masks Apprise URLs
+        resp = self.client.get("/api/config")
+        self.assertEqual(resp.status_code, 200)
+        masked = resp.json()
+        self.assertEqual(masked["notifications"]["apprise_urls"], ["********"])
+
+        # 2. Saving masked payload preserves underlying tgram:// URL on disk
+        masked["notifications"]["daily_summary_hour"] = 19
+        save_resp = self.client.post("/api/config", json=masked)
+        self.assertEqual(save_resp.status_code, 200)
+        saved_disk = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved_disk["notifications"]["apprise_urls"], ["tgram://999888:SECRET_BOT/1234567"])
+        self.assertEqual(saved_disk["notifications"]["daily_summary_hour"], 19)
+
+        # 3. POST /api/notifications/test resolves ******** and sends via Apprise
+        with patch("apprise.Apprise") as mock_apprise_cls:
+            mock_ap = MagicMock()
+            mock_ap.add.return_value = True
+            mock_ap.__len__.return_value = 1
+            mock_ap.notify.return_value = True
+            mock_apprise_cls.return_value = mock_ap
+
+            test_resp = self.client.post("/api/notifications/test", json={"apprise_urls": ["********"]})
+            self.assertEqual(test_resp.status_code, 200)
+            self.assertTrue(test_resp.json()["success"])
+            mock_ap.add.assert_called_once_with("tgram://999888:SECRET_BOT/1234567")
+
 
 if __name__ == "__main__":
     unittest.main()
