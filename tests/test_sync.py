@@ -852,6 +852,78 @@ class TestSyncComponents(unittest.TestCase):
         finally:
             watcher.stop()
 
+    def test_incremental_album_sync_only_syncs_changes(self):
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="k"),
+            icloud=ICloudConfig(apple_id="test@example.com", enabled=True),
+            amazon=AmazonConfig(cookies={"session-id": "s"}, enabled=True),
+            sync=SyncSettings(dry_run=False, enable_immich=True, enable_icloud=True, enable_amazon=True),
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        self.db.upsert_asset("s1", "m1", "p1.jpg", 100, immich_id="imm-1", icloud_id="ic-1", amazon_id="amz-1")
+        self.db.upsert_asset("s2", "m2", "p2.jpg", 100, immich_id="imm-2", icloud_id="ic-2", amazon_id="amz-2")
+
+        album_v1 = {"id": "alb-1", "albumName": "Trip 2026", "updatedAt": "2026-11-18T00:00:00Z", "assetCount": 1}
+        engine.immich = MagicMock()
+        engine.immich.get_albums.return_value = [album_v1]
+        engine.immich.get_album_details.return_value = {**album_v1, "assets": [{"id": "imm-1"}]}
+
+        engine.amazon = MagicMock()
+        engine.amazon.create_album.return_value = "amz-alb-1"
+        engine.amazon.add_to_album.return_value = True
+        engine.amazon.set_album_cover.return_value = True
+
+        engine.icloud = MagicMock()
+        engine.icloud.create_album.return_value = MagicMock()
+        engine.icloud.find_photo_by_id.side_effect = lambda pid: f"photo:{pid}"
+        engine.icloud.add_to_album.return_value = True
+
+        # Cycle 1: Initial album creation + first photo
+        self.assertEqual(engine._sync_albums(), 1)
+        engine.amazon.create_album.assert_called_once_with("Trip 2026", ["amz-1"])
+        engine.icloud.create_album.assert_called_once_with("Trip 2026")
+        engine.icloud.add_to_album.assert_called_once_with("Trip 2026", "photo:ic-1")
+
+        # Cycle 2: No changes -> fast-skip, zero detail or destination calls
+        engine.immich.get_album_details.reset_mock()
+        engine.amazon.reset_mock()
+        engine.icloud.reset_mock()
+        self.assertEqual(engine._sync_albums(), 0)
+        engine.immich.get_album_details.assert_not_called()
+        engine.amazon.create_album.assert_not_called()
+        engine.amazon.add_to_album.assert_not_called()
+        engine.icloud.create_album.assert_not_called()
+        engine.icloud.add_to_album.assert_not_called()
+
+        # Cycle 3: Second photo added -> only the new photo is sent to Amazon & iCloud
+        album_v2 = {"id": "alb-1", "albumName": "Trip 2026", "updatedAt": "2026-11-18T01:00:00Z", "assetCount": 2}
+        engine.immich.get_albums.return_value = [album_v2]
+        engine.immich.get_album_details.return_value = {**album_v2, "assets": [{"id": "imm-1"}, {"id": "imm-2"}]}
+
+        self.assertEqual(engine._sync_albums(), 1)
+        engine.amazon.add_to_album.assert_called_once_with("amz-alb-1", ["amz-2"], cover_node_id=None)
+        engine.icloud.find_photo_by_id.assert_called_once_with("ic-2")
+        engine.icloud.add_to_album.assert_called_once_with("Trip 2026", "photo:ic-2")
+
+        # Cycle 4: Only album cover changed -> only Amazon cover is updated
+        engine.amazon.reset_mock()
+        engine.icloud.reset_mock()
+        album_v3 = {
+            "id": "alb-1",
+            "albumName": "Trip 2026",
+            "updatedAt": "2026-11-18T02:00:00Z",
+            "assetCount": 2,
+            "albumThumbnailAssetId": "imm-2",
+        }
+        engine.immich.get_albums.return_value = [album_v3]
+        engine.immich.get_album_details.return_value = {**album_v3, "assets": [{"id": "imm-1"}, {"id": "imm-2"}]}
+
+        self.assertEqual(engine._sync_albums(), 1)
+        engine.amazon.add_to_album.assert_not_called()
+        engine.amazon.set_album_cover.assert_called_once_with("amz-alb-1", "amz-2")
+        engine.icloud.add_to_album.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

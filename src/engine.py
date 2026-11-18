@@ -1,4 +1,5 @@
 import time
+import json
 import base64
 import sqlite3
 import logging
@@ -51,6 +52,7 @@ class SyncEngine:
                 pass
 
         self.dry_run = config.sync.dry_run
+        self._newly_synced_immich_ids: Set[str] = set()
 
     def check_pause_and_stop(
         self,
@@ -143,6 +145,7 @@ class SyncEngine:
         3. Album Sync: Sync Immich visual albums and contents to Amazon Photos and iCloud Photos
         4. Skip iCloud/Amazon intake into Immich to maintain one-way source of truth.
         """
+        self._newly_synced_immich_ids = set()
         stats = {
             "icloud_ingested": 0,
             "immich_uploaded": 0,
@@ -484,6 +487,8 @@ class SyncEngine:
                         amazon_id=amazon_id,
                         status="ACTIVE"
                     )
+                    if immich_id and (amazon_id or icloud_id):
+                        self._newly_synced_immich_ids.add(immich_id)
                 count += 1
             except Exception as e:
                 logger.error(f"Failed syncing Immich asset {filename} to Amazon/iCloud: {e}")
@@ -787,6 +792,191 @@ class SyncEngine:
                 except OSError:
                     pass
 
+    @staticmethod
+    def _parse_album_state(raw_state: Optional[str]) -> Optional[Dict[str, Any]]:
+        """Parse persisted JSON album sync state, returning None if absent or invalid."""
+        if not raw_state:
+            return None
+        try:
+            parsed = json.loads(raw_state)
+            return parsed if isinstance(parsed, dict) else None
+        except (ValueError, TypeError):
+            return None
+
+    def _can_fast_skip_album(
+        self,
+        album: Dict[str, Any],
+        db_album: Optional[Dict[str, Any]],
+        prev_state: Optional[Dict[str, Any]],
+    ) -> bool:
+        """Return True when Immich album summary confirms no changes and no Step-2 assets arrived."""
+        if self._newly_synced_immich_ids or not db_album or not prev_state:
+            return False
+
+        updated_at = album.get("updatedAt")
+        asset_count = album.get("assetCount")
+        if updated_at is None or asset_count is None:
+            return False
+
+        if (
+            prev_state.get("name") != album.get("albumName", "Untitled Album")
+            or prev_state.get("updated_at") != updated_at
+            or prev_state.get("asset_count") != asset_count
+            or prev_state.get("thumbnail_asset_id") != album.get("albumThumbnailAssetId")
+        ):
+            return False
+
+        if self.is_amazon_enabled and not prev_state.get("amazon_checked", False):
+            return False
+        if self.is_icloud_enabled and not prev_state.get("icloud_checked", False):
+            return False
+
+        return True
+
+    def _resolve_amazon_node_id(self, immich_asset_id: Optional[str]) -> Optional[str]:
+        """Look up a synced Amazon Photos node ID for an Immich asset ID."""
+        if not immich_asset_id:
+            return None
+        record = self.db.get_asset_by_immich_id(immich_asset_id)
+        if not record:
+            return None
+        amz_id = record.get("amazon_id")
+        if not amz_id or amz_id == "CONFLICT_EXISTING" or str(amz_id).startswith("dry_run"):
+            return None
+        return amz_id
+
+    def _sync_album_to_amazon(
+        self,
+        album_name: str,
+        amazon_album_id: Optional[str],
+        amazon_node_ids: List[str],
+        cover_node_id: Optional[str],
+        prev_state: Optional[Dict[str, Any]],
+    ):
+        """Incrementally sync album creation, missing nodes, and cover changes to Amazon Photos."""
+        prev_synced = set((prev_state or {}).get("amazon_synced", []))
+        prev_cover = (prev_state or {}).get("amazon_cover")
+        prev_checked = bool((prev_state or {}).get("amazon_checked", False))
+
+        if not self.is_amazon_enabled:
+            return amazon_album_id, list(prev_synced), prev_cover, prev_checked, False
+
+        unique_nodes = list(dict.fromkeys(amazon_node_ids))
+
+        if not amazon_album_id:
+            if not unique_nodes:
+                logger.info(f"  -> Skipping creation of empty/video-only album '{album_name}' in Amazon Photos (0 synced photos).")
+                return None, [], None, True, False
+            if self.dry_run:
+                logger.info(f"  -> [DRY RUN] Would create album '{album_name}' in Amazon Photos with {len(unique_nodes)} items.")
+                return f"dry_run_album_{album_name}", [], prev_cover, prev_checked, False
+
+            if cover_node_id:
+                created_id = self.amazon.create_album(album_name, unique_nodes, cover_node_id=cover_node_id)
+            else:
+                created_id = self.amazon.create_album(album_name, unique_nodes)
+            if created_id:
+                logger.info(f"  -> Created album '{album_name}' in Amazon Photos (ID: {created_id})")
+                return created_id, unique_nodes, cover_node_id, True, True
+            return None, [], prev_cover, False, False
+
+        missing_nodes = [nid for nid in unique_nodes if nid not in prev_synced]
+        cover_changed = bool(cover_node_id and cover_node_id != prev_cover)
+
+        if not missing_nodes and not cover_changed:
+            kept_nodes = [nid for nid in unique_nodes if nid in prev_synced]
+            return amazon_album_id, kept_nodes, prev_cover, True, False
+
+        if self.dry_run:
+            logger.info(f"  -> [DRY RUN] Would update album '{album_name}' in Amazon Photos with {len(missing_nodes)} new items.")
+            return amazon_album_id, [nid for nid in unique_nodes if nid in prev_synced], prev_cover, prev_checked, False
+
+        synced_set = set(prev_synced)
+        saved_cover = prev_cover
+        all_ok = True
+        changed = False
+
+        if missing_nodes:
+            ok = bool(self.amazon.add_to_album(amazon_album_id, missing_nodes, cover_node_id=cover_node_id))
+            if ok:
+                synced_set.update(missing_nodes)
+                if cover_node_id:
+                    saved_cover = cover_node_id
+                changed = True
+                logger.info(f"  -> Added {len(missing_nodes)} new item(s) to Amazon Photos album '{album_name}'.")
+            else:
+                all_ok = False
+        elif cover_changed and cover_node_id:
+            if self.amazon.set_album_cover(amazon_album_id, cover_node_id):
+                saved_cover = cover_node_id
+                changed = True
+                logger.info(f"  -> Updated cover for Amazon Photos album '{album_name}'.")
+            else:
+                all_ok = False
+
+        kept_nodes = [nid for nid in unique_nodes if nid in synced_set]
+        return amazon_album_id, kept_nodes, saved_cover, all_ok, changed
+
+    def _sync_album_to_icloud(
+        self,
+        album_name: str,
+        asset_ids: List[str],
+        prev_state: Optional[Dict[str, Any]],
+    ):
+        """Incrementally add missing synced assets to an iCloud Photos album."""
+        prev_synced = set((prev_state or {}).get("icloud_synced", []))
+        prev_init = bool((prev_state or {}).get("icloud_initialized", False))
+        prev_checked = bool((prev_state or {}).get("icloud_checked", False))
+
+        if not self.is_icloud_enabled:
+            return list(prev_synced), prev_init, prev_checked, False
+
+        icloud_candidates: List[str] = []
+        for aid in asset_ids:
+            record = self.db.get_asset_by_immich_id(aid)
+            if record and record.get("icloud_id"):
+                icloud_candidates.append(record["icloud_id"])
+
+        unique_candidates = list(dict.fromkeys(icloud_candidates))
+        missing_ids = [icid for icid in unique_candidates if icid not in prev_synced]
+
+        if not missing_ids and prev_init:
+            return [icid for icid in unique_candidates if icid in prev_synced], True, True, False
+
+        if self.dry_run:
+            logger.info(f"  -> [DRY RUN] Would sync {len(missing_ids)} new item(s) to iCloud album '{album_name}'.")
+            return [icid for icid in unique_candidates if icid in prev_synced], prev_init, prev_checked, False
+
+        synced_set = set(prev_synced)
+        initialized = prev_init
+        all_ok = True
+        changed = False
+
+        try:
+            icloud_album = self.icloud.create_album(album_name)
+            if icloud_album:
+                if not prev_init:
+                    changed = True
+                initialized = True
+                logger.info(f"  -> Created/Verified album '{album_name}' in iCloud Photos ({len(missing_ids)} new item(s)).")
+                for icid in missing_ids:
+                    if self.stop_event and self.stop_event.is_set():
+                        all_ok = False
+                        break
+                    photo = self.icloud.find_photo_by_id(icid)
+                    if photo and self.icloud.add_to_album(album_name, photo) is not False:
+                        synced_set.add(icid)
+                        changed = True
+                    else:
+                        all_ok = False
+            else:
+                all_ok = False
+        except Exception as e:
+            logger.warning(f"  -> Note: iCloud album sync for '{album_name}' had limitations: {e}")
+            all_ok = False
+
+        return [icid for icid in unique_candidates if icid in synced_set], initialized, all_ok, changed
+
     def _sync_albums(self) -> int:
         immich_albums = self.immich.get_albums()
         synced_albums = 0
@@ -813,7 +1003,14 @@ class SyncEngine:
                 logger.info(f"Stop signal received during album sync. Exiting loop at {idx + 1}/{total_albums}.")
                 break
 
-            self.report_progress(pct, "albums", "Syncing Albums", idx + 1, total_albums, album_name, f"Syncing album {idx + 1}/{total_albums}: '{album_name}'")
+            db_album = self.db.get_album(immich_album_id)
+            prev_state = self._parse_album_state(db_album.get("synced_state") if db_album else None)
+
+            if self._can_fast_skip_album(album, db_album, prev_state):
+                logger.debug(f"[Sync Album] Skipping unchanged album '{album_name}'.")
+                continue
+
+            self.report_progress(pct, "albums", "Syncing Albums", idx + 1, total_albums, album_name, f"Checking album {idx + 1}/{total_albums}: '{album_name}'")
 
             details = self.immich.get_album_details(immich_album_id)
             album_assets = details.get("assets", [])
@@ -821,71 +1018,52 @@ class SyncEngine:
 
             logger.info(f"[Sync Album] Checking Immich album '{album_name}' ({len(asset_ids)} photos)...")
 
-            # Resolve Amazon node IDs for these photos
-            amazon_node_ids = []
-            for aid in asset_ids:
-                record = self.db.get_asset_by_immich_id(aid)
-                if record and record.get("amazon_id") and record["amazon_id"] != "CONFLICT_EXISTING" and not record["amazon_id"].startswith("dry_run"):
-                    amazon_node_ids.append(record["amazon_id"])
-
+            amazon_node_ids = [
+                nid for aid in asset_ids
+                if (nid := self._resolve_amazon_node_id(aid)) is not None
+            ]
             thumb_asset_id = details.get("albumThumbnailAssetId")
-            cover_node_id = None
-            if thumb_asset_id:
-                thumb_rec = self.db.get_asset_by_immich_id(thumb_asset_id)
-                if thumb_rec and thumb_rec.get("amazon_id") and thumb_rec["amazon_id"] != "CONFLICT_EXISTING" and not thumb_rec["amazon_id"].startswith("dry_run"):
-                    cover_node_id = thumb_rec["amazon_id"]
+            if thumb_asset_id is None:
+                thumb_asset_id = album.get("albumThumbnailAssetId")
+            cover_node_id = self._resolve_amazon_node_id(thumb_asset_id)
 
-            db_album = self.db.get_album(immich_album_id)
-
-            # Sync to Amazon Photos (if Amazon enabled)
             amazon_album_id = db_album.get("amazon_id") if db_album else None
-            if self.is_amazon_enabled:
-                if not amazon_album_id:
-                    if not amazon_node_ids:
-                        logger.info(f"  -> Skipping creation of empty/video-only album '{album_name}' in Amazon Photos (0 synced photos).")
-                    elif not self.dry_run:
-                        if cover_node_id:
-                            amazon_album_id = self.amazon.create_album(album_name, amazon_node_ids, cover_node_id=cover_node_id)
-                        else:
-                            amazon_album_id = self.amazon.create_album(album_name, amazon_node_ids)
-                        logger.info(f"  -> Created album '{album_name}' in Amazon Photos (ID: {amazon_album_id})")
-                    else:
-                        logger.info(f"  -> [DRY RUN] Would create album '{album_name}' in Amazon Photos with {len(amazon_node_ids)} items.")
-                        amazon_album_id = f"dry_run_album_{album_name}"
-                else:
-                    if not self.dry_run and amazon_node_ids:
-                        self.amazon.add_to_album(amazon_album_id, amazon_node_ids, cover_node_id=cover_node_id)
-                        logger.info(f"  -> Updated album '{album_name}' in Amazon Photos with {len(amazon_node_ids)} items.")
+            amazon_album_id, amz_synced, amz_cover, amz_checked, amz_changed = self._sync_album_to_amazon(
+                album_name, amazon_album_id, amazon_node_ids, cover_node_id, prev_state
+            )
 
-            # Sync to iCloud Photos (if iCloud enabled)
             icloud_album_id = db_album.get("icloud_id") if db_album else None
-            if self.is_icloud_enabled:
-                try:
-                    if not self.dry_run:
-                        icloud_album = self.icloud.create_album(album_name)
-                        if icloud_album:
-                            logger.info(f"  -> Created/Verified album '{album_name}' in iCloud Photos.")
-                            for aid in asset_ids:
-                                if self.stop_event and self.stop_event.is_set():
-                                    break
-                                record = self.db.get_asset_by_immich_id(aid)
-                                if record and record.get("icloud_id"):
-                                    photo = self.icloud.find_photo_by_id(record["icloud_id"])
-                                    if photo:
-                                        self.icloud.add_to_album(album_name, photo)
-                    else:
-                        logger.info(f"  -> [DRY RUN] Would sync album '{album_name}' to iCloud Photos.")
-                except Exception as e:
-                    logger.warning(f"  -> Note: iCloud album sync for '{album_name}' had limitations: {e}")
+            icloud_synced, icloud_init, icloud_checked, icloud_changed = self._sync_album_to_icloud(
+                album_name, asset_ids, prev_state
+            )
+
+            album_changed = amz_changed or icloud_changed
+            updated_at = details.get("updatedAt") if details.get("updatedAt") is not None else album.get("updatedAt")
+            asset_count = details.get("assetCount") if details.get("assetCount") is not None else album.get("assetCount")
+
+            new_state = {
+                "name": album_name,
+                "updated_at": updated_at,
+                "asset_count": asset_count,
+                "thumbnail_asset_id": thumb_asset_id,
+                "amazon_synced": amz_synced,
+                "amazon_cover": amz_cover,
+                "amazon_checked": amz_checked,
+                "icloud_synced": icloud_synced,
+                "icloud_initialized": icloud_init,
+                "icloud_checked": icloud_checked,
+            }
 
             if not self.dry_run:
                 self.db.upsert_album(
                     immich_id=immich_album_id,
                     name=album_name,
                     amazon_id=amazon_album_id,
-                    icloud_id=icloud_album_id
+                    icloud_id=icloud_album_id,
+                    synced_state=json.dumps(new_state),
                 )
 
-            synced_albums += 1
+            if album_changed:
+                synced_albums += 1
 
         return synced_albums

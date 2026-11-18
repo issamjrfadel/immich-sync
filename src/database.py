@@ -43,6 +43,7 @@ class SyncDatabase:
                     name TEXT,
                     amazon_id TEXT,
                     icloud_id TEXT,
+                    synced_state TEXT,
                     last_synced_at TIMESTAMP
                 )
             """)
@@ -72,6 +73,11 @@ class SyncDatabase:
                     notified_at TIMESTAMP
                 )
             """)
+
+            cursor.execute("PRAGMA table_info(albums)")
+            album_cols = {row[1] for row in cursor.fetchall()}
+            if "synced_state" not in album_cols:
+                cursor.execute("ALTER TABLE albums ADD COLUMN synced_state TEXT")
 
             # Indexes
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_assets_sha1 ON assets(sha1)")
@@ -186,20 +192,22 @@ class SyncDatabase:
         immich_id: str,
         name: str,
         amazon_id: Optional[str] = None,
-        icloud_id: Optional[str] = None
+        icloud_id: Optional[str] = None,
+        synced_state: Optional[str] = None
     ):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO albums (immich_id, name, amazon_id, icloud_id, last_synced_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO albums (immich_id, name, amazon_id, icloud_id, synced_state, last_synced_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(immich_id) DO UPDATE SET
                     name = excluded.name,
                     amazon_id = COALESCE(excluded.amazon_id, albums.amazon_id),
                     icloud_id = COALESCE(excluded.icloud_id, albums.icloud_id),
+                    synced_state = COALESCE(excluded.synced_state, albums.synced_state),
                     last_synced_at = excluded.last_synced_at
-            """, (immich_id, name, amazon_id, icloud_id, now))
+            """, (immich_id, name, amazon_id, icloud_id, synced_state, now))
             conn.commit()
 
     def log_sync(self, action: str, details: str):
