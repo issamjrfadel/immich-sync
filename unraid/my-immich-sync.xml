@@ -13,7 +13,7 @@
   <Category>MediaApp:Photos Tools:</Category>
   <WebUI>http://[IP]:[PORT:5050]/</WebUI>
   <TemplateURL/>
-  <Icon>https://raw.githubusercontent.com/immich-app/immich/main/design/immich-logo.svg</Icon>
+  <Icon>https://raw.githubusercontent.com/issamjrfadel/immich-sync/main/assets/icon.png</Icon>
   <ExtraParams>--restart unless-stopped</ExtraParams>
   <PostArgs/>
   <CPUset/>

@@ -54,6 +54,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY app.py sync.py config.example.json docker-entrypoint.sh ./
 COPY src/ ./src/
+COPY assets/ ./assets/
 
 RUN sed -i 's/\r$//' /app/docker-entrypoint.sh && chmod +x /app/docker-entrypoint.sh \
     && mkdir -p /app/data

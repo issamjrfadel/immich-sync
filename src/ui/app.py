@@ -373,8 +373,8 @@ def create_app(
     @app.middleware("http")
     async def optional_basic_auth(request: Request, call_next):
         client_host = request.client.host if request.client else ""
-        # Allow CORS preflight and localhost Docker healthchecks on /api/status
-        if request.method == "OPTIONS" or (
+        # Allow CORS preflight, localhost Docker healthchecks, and public app icon/favicon
+        if request.method == "OPTIONS" or request.url.path in ("/icon.png", "/favicon.ico") or (
             request.url.path == "/api/status" and client_host in ("127.0.0.1", "::1", "localhost")
         ):
             return await call_next(request)
@@ -403,6 +403,14 @@ def create_app(
         except Exception as e:
             logger.error(f"Error loading {config_path}: {e}")
             return None
+
+    @app.get("/icon.png")
+    @app.get("/favicon.ico")
+    async def serve_app_icon():
+        icon_file = Path(__file__).resolve().parent.parent.parent / "assets" / "icon.png"
+        if not icon_file.is_file():
+            raise HTTPException(status_code=404, detail="Icon not found")
+        return FileResponse(icon_file, media_type="image/png")
 
     @app.get("/", response_class=HTMLResponse)
     async def serve_index():

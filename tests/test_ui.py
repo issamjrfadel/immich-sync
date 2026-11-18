@@ -50,6 +50,10 @@ class TestUIDashboard(unittest.TestCase):
         self.assertIn("Immich Multi-Sync", resp.text)
         self.assertIn("Live Activity Stream", resp.text)
 
+        icon_resp = self.client.get("/icon.png")
+        self.assertEqual(icon_resp.status_code, 200)
+        self.assertEqual(icon_resp.headers.get("content-type"), "image/png")
+
     def test_status_endpoint(self):
         resp = self.client.get("/api/status")
         self.assertEqual(resp.status_code, 200)
