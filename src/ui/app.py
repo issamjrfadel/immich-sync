@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from src.config import load_config, save_config, AppConfig
 from src.database import SyncDatabase
 from src.engine import SyncEngine
+from src.events import ImmichEventWatcher
 from src.notifications import maybe_send_daily_summary, maybe_send_error_alert, send_test_notification
 from src.clients.immich import ImmichClient
 from src.clients.icloud import ICloudClient
@@ -86,8 +87,10 @@ sync_state = {
     "daemon_running": False,
     "daemon_thread": None,
     "stop_daemon_event": threading.Event(),
+    "trigger_sync_event": threading.Event(),
     "stop_sync_event": threading.Event(),
     "pause_sync_event": threading.Event(),
+    "event_watcher": None,
     "pending_icloud_client": None
 }
 
@@ -147,6 +150,8 @@ def _mask_config_dict(data: dict) -> dict:
     apprise_urls = masked.get("notifications", {}).get("apprise_urls")
     if isinstance(apprise_urls, list) and apprise_urls:
         masked["notifications"]["apprise_urls"] = [SECRET_MASK for u in apprise_urls if u]
+    if masked.get("sync", {}).get("webhook_secret"):
+        masked["sync"]["webhook_secret"] = SECRET_MASK
     return masked
 
 def sync_test_service(service: str, payload: Optional[dict], cfg: Optional[AppConfig]) -> dict:
@@ -382,6 +387,17 @@ def create_app(
         ):
             return await call_next(request)
 
+        # Allow Immich webhook calls authenticated by a configured webhook_secret
+        if request.url.path == "/api/webhook/immich":
+            cfg_wh = get_cfg()
+            expected_secret = (cfg_wh.sync.webhook_secret or "").strip() if cfg_wh else ""
+            provided_secret = (
+                request.headers.get("X-Webhook-Secret", "").strip()
+                or request.query_params.get("secret", "").strip()
+            )
+            if expected_secret and secrets.compare_digest(provided_secret, expected_secret):
+                return await call_next(request)
+
         if not _is_basic_auth_authorized(request.headers.get("Authorization", "")):
             return Response(
                 content="Unauthorized",
@@ -451,6 +467,15 @@ def create_app(
             "progress": sync_progress,
             "one_way_immich_master": getattr(cfg.sync, "one_way_immich_master", True) if cfg else True,
             "force_deletes": getattr(cfg.sync, "force_deletes", False) if cfg else False,
+            "realtime_events": {
+                "enabled": bool(getattr(cfg.sync, "realtime_events_enabled", True)) if cfg else True,
+                "connected": bool(
+                    sync_state.get("event_watcher")
+                    and getattr(sync_state["event_watcher"], "is_connected", False)
+                ),
+                "last_event": getattr(sync_state.get("event_watcher"), "last_event_name", None),
+                "last_event_time": getattr(sync_state.get("event_watcher"), "last_event_time", None),
+            },
             "storage_warning": app.state.storage_warning,
             "config_path": str(Path(config_path).resolve()),
         }
@@ -692,21 +717,17 @@ def create_app(
         except Exception as e:
             logger.warning(f"Failed recording daily scan stats / notifications: {e}")
 
-    @app.post("/api/sync/run")
-    async def trigger_sync(req: SyncRunRequest):
-        if sync_state["is_syncing"]:
-            raise HTTPException(status_code=400, detail="A sync cycle is already in progress.")
-
-        cfg = get_cfg()
-        if not cfg:
-            raise HTTPException(status_code=400, detail="Configuration not found. Please setup config first.")
-
+    def _start_manual_sync_worker(
+        sync_cfg: AppConfig,
+        limit: Optional[int] = None,
+        force_deletes: Optional[bool] = None,
+    ) -> None:
         def run_worker():
             sync_state["is_syncing"] = True
             sync_state["is_paused"] = False
             sync_state["stop_sync_event"].clear()
             sync_state["pause_sync_event"].clear()
-            logger.info("Triggering manual sync cycle from Web UI...")
+            logger.info("Triggering sync cycle...")
             handle_sync_progress({
                 "percent": 0,
                 "phase": "starting",
@@ -717,19 +738,6 @@ def create_app(
                 "action": "Initializing sync engine..."
             })
             try:
-                sync_cfg = cfg.model_copy(deep=True)
-                if req.dry_run:
-                    sync_cfg.sync.dry_run = True
-                if req.enable_immich is not None:
-                    sync_cfg.sync.enable_immich = req.enable_immich
-                    sync_cfg.immich.enabled = req.enable_immich
-                if req.enable_icloud is not None:
-                    sync_cfg.sync.enable_icloud = req.enable_icloud
-                    sync_cfg.icloud.enabled = req.enable_icloud
-                if req.enable_amazon is not None:
-                    sync_cfg.sync.enable_amazon = req.enable_amazon
-                    sync_cfg.amazon.enabled = req.enable_amazon
-
                 engine = SyncEngine(
                     sync_cfg,
                     db_path=db_path,
@@ -737,8 +745,8 @@ def create_app(
                     stop_event=sync_state["stop_sync_event"],
                     pause_event=sync_state["pause_sync_event"]
                 )
-                effective_force_deletes = req.force_deletes if req.force_deletes is not None else sync_cfg.sync.force_deletes
-                stats = engine.run_sync_cycle(limit_intake=req.limit, force_deletes=effective_force_deletes)
+                effective_force_deletes = force_deletes if force_deletes is not None else sync_cfg.sync.force_deletes
+                stats = engine.run_sync_cycle(limit_intake=limit, force_deletes=effective_force_deletes)
                 sync_state["last_stats"] = stats
                 sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
                 _record_cycle_and_notify(sync_cfg, stats)
@@ -774,7 +782,65 @@ def create_app(
 
         thread = threading.Thread(target=run_worker, daemon=True)
         thread.start()
+
+    @app.post("/api/sync/run")
+    async def trigger_sync(req: SyncRunRequest):
+        if sync_state["is_syncing"]:
+            raise HTTPException(status_code=400, detail="A sync cycle is already in progress.")
+
+        cfg = get_cfg()
+        if not cfg:
+            raise HTTPException(status_code=400, detail="Configuration not found. Please setup config first.")
+
+        sync_cfg = cfg.model_copy(deep=True)
+        if req.dry_run:
+            sync_cfg.sync.dry_run = True
+        if req.enable_immich is not None:
+            sync_cfg.sync.enable_immich = req.enable_immich
+            sync_cfg.immich.enabled = req.enable_immich
+        if req.enable_icloud is not None:
+            sync_cfg.sync.enable_icloud = req.enable_icloud
+            sync_cfg.icloud.enabled = req.enable_icloud
+        if req.enable_amazon is not None:
+            sync_cfg.sync.enable_amazon = req.enable_amazon
+            sync_cfg.amazon.enabled = req.enable_amazon
+
+        _start_manual_sync_worker(sync_cfg, limit=req.limit, force_deletes=req.force_deletes)
         return {"status": "started", "dry_run": req.dry_run}
+
+    @app.post("/api/webhook/immich")
+    async def immich_webhook_trigger(request: Request):
+        cfg = get_cfg()
+        if not cfg:
+            raise HTTPException(status_code=400, detail="Configuration not found.")
+
+        expected_secret = (cfg.sync.webhook_secret or "").strip()
+        if expected_secret:
+            provided_secret = (
+                request.headers.get("X-Webhook-Secret", "").strip()
+                or request.query_params.get("secret", "").strip()
+            )
+            if not secrets.compare_digest(provided_secret, expected_secret):
+                raise HTTPException(status_code=401, detail="Invalid or missing webhook secret.")
+
+        event_label = "webhook"
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                event_label = str(body.get("event") or body.get("trigger") or body.get("type") or "webhook")
+        except Exception:
+            pass
+
+        logger.info(f"Received Immich webhook trigger ({event_label}).")
+        sync_state["trigger_sync_event"].set()
+        if sync_state["daemon_running"]:
+            return {"status": "triggered", "mode": "daemon", "event": event_label}
+        if sync_state["is_syncing"]:
+            return {"status": "queued", "mode": "manual", "event": event_label}
+
+        sync_state["trigger_sync_event"].clear()
+        _start_manual_sync_worker(cfg.model_copy(deep=True))
+        return {"status": "triggered", "mode": "manual", "event": event_label}
 
     def launch_daemon_thread() -> str:
         if sync_state["daemon_running"]:
@@ -789,61 +855,106 @@ def create_app(
 
         def daemon_worker():
             logger.info(f"Sync daemon started (polling every {cfg.sync.poll_interval_seconds}s)")
+            watcher_sig = None
 
-            while not sync_state["stop_daemon_event"].is_set():
-                active_cfg = get_cfg() or cfg
-                interval = active_cfg.sync.poll_interval_seconds
+            def _ensure_watcher(active_cfg: AppConfig) -> None:
+                nonlocal watcher_sig
+                want = bool(
+                    getattr(active_cfg.sync, "realtime_events_enabled", True)
+                    and active_cfg.immich.enabled
+                    and active_cfg.immich.api_key
+                    and active_cfg.immich.url
+                )
+                sig = (
+                    want,
+                    active_cfg.immich.url,
+                    active_cfg.immich.api_key,
+                    active_cfg.immich.verify_ssl,
+                    getattr(active_cfg.sync, "event_debounce_seconds", 15),
+                )
+                if sig == watcher_sig:
+                    return
+                existing_w = sync_state.get("event_watcher")
+                if existing_w is not None:
+                    existing_w.stop()
+                    sync_state["event_watcher"] = None
+                watcher_sig = sig
+                if want:
+                    new_w = ImmichEventWatcher(
+                        immich_url=active_cfg.immich.url,
+                        api_key=active_cfg.immich.api_key,
+                        verify_ssl=active_cfg.immich.verify_ssl,
+                        debounce_seconds=getattr(active_cfg.sync, "event_debounce_seconds", 15),
+                        on_trigger=lambda evt: sync_state["trigger_sync_event"].set(),
+                    )
+                    sync_state["event_watcher"] = new_w
+                    new_w.start()
 
-                if not sync_state["is_syncing"]:
-                    sync_state["is_syncing"] = True
-                    sync_state["is_paused"] = False
-                    sync_state["stop_sync_event"].clear()
-                    sync_state["pause_sync_event"].clear()
-                    try:
-                        engine = SyncEngine(
-                            active_cfg,
-                            db_path=db_path,
-                            progress_callback=handle_sync_progress,
-                            stop_event=sync_state["stop_sync_event"],
-                            pause_event=sync_state["pause_sync_event"],
-                        )
-                        stats = engine.run_sync_cycle(force_deletes=active_cfg.sync.force_deletes)
-                        sync_state["last_stats"] = stats
-                        sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                        _record_cycle_and_notify(active_cfg, stats)
-                    except Exception as e:
-                        logger.error(f"Daemon cycle error: {e}")
-                    finally:
-                        was_stopped = sync_state["stop_sync_event"].is_set()
-                        sync_state["is_syncing"] = False
+            try:
+                while not sync_state["stop_daemon_event"].is_set():
+                    active_cfg = get_cfg() or cfg
+                    interval = active_cfg.sync.poll_interval_seconds
+                    _ensure_watcher(active_cfg)
+
+                    if not sync_state["is_syncing"]:
+                        sync_state["is_syncing"] = True
                         sync_state["is_paused"] = False
                         sync_state["stop_sync_event"].clear()
                         sync_state["pause_sync_event"].clear()
-                        sync_progress["active"] = False
-                        if was_stopped:
-                            sync_progress["phase"] = "stopped"
-                            sync_progress["phase_name"] = "Sync Stopped"
-                            sync_progress["action"] = "Sync cycle was stopped by user."
-                            if log_broadcaster._loop and log_broadcaster.active_connections:
-                                asyncio.run_coroutine_threadsafe(
-                                    log_broadcaster.broadcast({"type": "progress", "data": sync_progress}),
-                                    log_broadcaster._loop,
-                                )
-
-                # Sleep in short increments to respond quickly to stop requests
-                for sec in range(interval):
-                    if sync_state["stop_daemon_event"].is_set():
-                        break
-                    if sec > 0 and sec % 60 == 0:
+                        sync_state["trigger_sync_event"].clear()
                         try:
-                            latest_cfg = get_cfg() or active_cfg
-                            maybe_send_daily_summary(latest_cfg, SyncDatabase(db_path))
+                            engine = SyncEngine(
+                                active_cfg,
+                                db_path=db_path,
+                                progress_callback=handle_sync_progress,
+                                stop_event=sync_state["stop_sync_event"],
+                                pause_event=sync_state["pause_sync_event"],
+                            )
+                            stats = engine.run_sync_cycle(force_deletes=active_cfg.sync.force_deletes)
+                            sync_state["last_stats"] = stats
+                            sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                            _record_cycle_and_notify(active_cfg, stats)
                         except Exception as e:
-                            logger.debug(f"Periodic daily notification check failed: {e}")
-                    time.sleep(1)
+                            logger.error(f"Daemon cycle error: {e}")
+                        finally:
+                            was_stopped = sync_state["stop_sync_event"].is_set()
+                            sync_state["is_syncing"] = False
+                            sync_state["is_paused"] = False
+                            sync_state["stop_sync_event"].clear()
+                            sync_state["pause_sync_event"].clear()
+                            sync_progress["active"] = False
+                            if was_stopped:
+                                sync_progress["phase"] = "stopped"
+                                sync_progress["phase_name"] = "Sync Stopped"
+                                sync_progress["action"] = "Sync cycle was stopped by user."
+                                if log_broadcaster._loop and log_broadcaster.active_connections:
+                                    asyncio.run_coroutine_threadsafe(
+                                        log_broadcaster.broadcast({"type": "progress", "data": sync_progress}),
+                                        log_broadcaster._loop,
+                                    )
 
-            logger.info("Sync daemon stopped.")
-            sync_state["daemon_running"] = False
+                    # Sleep in short increments to respond quickly to stop requests or real-time events
+                    for sec in range(interval):
+                        if sync_state["stop_daemon_event"].is_set():
+                            break
+                        if sync_state["trigger_sync_event"].is_set():
+                            sync_state["trigger_sync_event"].clear()
+                            logger.info("Waking sync daemon immediately from real-time Immich event / webhook.")
+                            break
+                        if sec > 0 and sec % 60 == 0:
+                            try:
+                                latest_cfg = get_cfg() or active_cfg
+                                maybe_send_daily_summary(latest_cfg, SyncDatabase(db_path))
+                            except Exception as e:
+                                logger.debug(f"Periodic daily notification check failed: {e}")
+                        time.sleep(1)
+            finally:
+                existing_w = sync_state.get("event_watcher")
+                if existing_w is not None:
+                    existing_w.stop()
+                    sync_state["event_watcher"] = None
+                logger.info("Sync daemon stopped.")
+                sync_state["daemon_running"] = False
 
         thread = threading.Thread(target=daemon_worker, daemon=True)
         sync_state["daemon_thread"] = thread
@@ -940,6 +1051,13 @@ def create_app(
                             elif u != SECRET_MASK:
                                 resolved_urls.append(u)
                         notif["apprise_urls"] = resolved_urls
+
+                sync_sec = merged_payload.setdefault("sync", {})
+                if sync_sec.get("webhook_secret") in (SECRET_MASK, "", None):
+                    if sync_sec.get("webhook_secret") == SECRET_MASK and existing_cfg.sync.webhook_secret:
+                        sync_sec["webhook_secret"] = existing_cfg.sync.webhook_secret
+                    elif sync_sec.get("webhook_secret") == "":
+                        sync_sec["webhook_secret"] = None
 
             validated = AppConfig.model_validate(merged_payload)
             save_config(validated, config_path)

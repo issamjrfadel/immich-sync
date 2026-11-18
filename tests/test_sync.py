@@ -824,6 +824,34 @@ class TestSyncComponents(unittest.TestCase):
         self.assertTrue(ok2)
         fake_ap.client.patch.assert_not_called()
 
+    def test_immich_event_watcher_debounces_burst(self):
+        import threading
+        from src.events import ImmichEventWatcher
+
+        triggered = []
+        done = threading.Event()
+
+        def on_trig(evt_name):
+            triggered.append(evt_name)
+            done.set()
+
+        watcher = ImmichEventWatcher(
+            immich_url="http://localhost:2283",
+            api_key="dummy",
+            debounce_seconds=1,
+            on_trigger=on_trig,
+        )
+        # Override debounce to fast sub-second for deterministic test
+        watcher.debounce_seconds = 0.08
+        try:
+            watcher.schedule_trigger("on_upload_success")
+            watcher.schedule_trigger("on_upload_success")
+            watcher.schedule_trigger("on_asset_trash")
+            self.assertTrue(done.wait(timeout=2.0))
+            self.assertEqual(triggered, ["on_asset_trash"])
+        finally:
+            watcher.stop()
+
 
 if __name__ == "__main__":
     unittest.main()

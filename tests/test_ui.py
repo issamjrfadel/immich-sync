@@ -465,6 +465,51 @@ class TestUIDashboard(unittest.TestCase):
         self.assertFalse(resp2.json()["force_deletes"])
         self.assertFalse(self.client.get("/api/status").json()["force_deletes"])
 
+    def test_immich_webhook_trigger_and_secret_masking(self):
+        from src.ui.app import sync_state
+
+        cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        cfg["sync"]["webhook_secret"] = "my-hook-secret"
+        self.cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        # 1. GET /api/config masks webhook_secret and preserves on POST
+        masked = self.client.get("/api/config").json()
+        self.assertEqual(masked["sync"]["webhook_secret"], "********")
+        self.client.post("/api/config", json=masked)
+        saved = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["sync"]["webhook_secret"], "my-hook-secret")
+
+        # 2. Webhook rejects missing/wrong secret and accepts valid X-Webhook-Secret
+        auth_app = create_app(
+            config_path=str(self.cfg_path),
+            db_path=str(self.db_path),
+            dashboard_password="ui-password",
+            dashboard_user="admin",
+        )
+        auth_client = TestClient(auth_app)
+        self.assertEqual(auth_client.post("/api/webhook/immich", json={"event": "AssetCreate"}).status_code, 401)
+        self.assertEqual(
+            auth_client.post("/api/webhook/immich", headers={"X-Webhook-Secret": "wrong"}).status_code,
+            401,
+        )
+
+        # Simulate running daemon so webhook sets trigger_sync_event without spawning real Immich sync
+        sync_state["daemon_running"] = True
+        sync_state["trigger_sync_event"].clear()
+        try:
+            ok_resp = auth_client.post(
+                "/api/webhook/immich",
+                headers={"X-Webhook-Secret": "my-hook-secret"},
+                json={"event": "AssetCreate"},
+            )
+            self.assertEqual(ok_resp.status_code, 200)
+            self.assertEqual(ok_resp.json()["status"], "triggered")
+            self.assertEqual(ok_resp.json()["mode"], "daemon")
+            self.assertTrue(sync_state["trigger_sync_event"].is_set())
+        finally:
+            sync_state["daemon_running"] = False
+            sync_state["trigger_sync_event"].clear()
+
 
 if __name__ == "__main__":
     unittest.main()
