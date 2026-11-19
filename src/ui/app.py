@@ -24,6 +24,7 @@ from src.config import load_config, save_config, AppConfig
 from src.database import SyncDatabase
 from src.engine import SyncEngine
 from src.events import ImmichEventWatcher
+from src.schedule import parse_schedule_times, next_scheduled_run
 from src.notifications import maybe_send_daily_summary, maybe_send_error_alert, send_test_notification
 from src.clients.immich import ImmichClient
 from src.clients.icloud import ICloudClient
@@ -467,8 +468,15 @@ def create_app(
             "progress": sync_progress,
             "one_way_immich_master": getattr(cfg.sync, "one_way_immich_master", True) if cfg else True,
             "force_deletes": getattr(cfg.sync, "force_deletes", False) if cfg else False,
+            "schedule": {
+                "times": list(getattr(cfg.sync, "scheduled_sync_times", []) or []) if cfg else [],
+                "next_run": sync_state.get("next_scheduled_run"),
+            },
             "realtime_events": {
-                "enabled": bool(getattr(cfg.sync, "realtime_events_enabled", True)) if cfg else True,
+                "enabled": bool(
+                    getattr(cfg.sync, "realtime_events_enabled", True)
+                    and not getattr(cfg.sync, "scheduled_sync_times", [])
+                ) if cfg else True,
                 "connected": bool(
                     sync_state.get("event_watcher")
                     and getattr(sync_state["event_watcher"], "is_connected", False)
@@ -853,6 +861,45 @@ def create_app(
         sync_state["stop_daemon_event"].clear()
         sync_state["daemon_running"] = True
 
+        def _wait_for_next_cycle(active_cfg: AppConfig, schedule: list, interval: int) -> None:
+            """Block until the next poll/scheduled slot, a webhook trigger, or a daemon stop."""
+            if schedule:
+                next_run = next_scheduled_run(schedule)
+                sync_state["next_scheduled_run"] = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
+                logger.info(f"Scheduled mode: next scan at {sync_state['next_scheduled_run']}.")
+                deadline = next_run.timestamp() if next_run else time.time() + interval
+            else:
+                sync_state["next_scheduled_run"] = None
+                deadline = time.time() + max(1, int(interval))
+
+            last_minute_check = time.time()
+            while time.time() < deadline:
+                if sync_state["stop_daemon_event"].is_set():
+                    return
+                if sync_state["trigger_sync_event"].is_set():
+                    sync_state["trigger_sync_event"].clear()
+                    logger.info("Waking sync daemon immediately from Immich event / webhook.")
+                    return
+                if time.time() - last_minute_check >= 60:
+                    last_minute_check = time.time()
+                    latest_cfg = get_cfg() or active_cfg
+                    try:
+                        maybe_send_daily_summary(latest_cfg, SyncDatabase(db_path))
+                    except Exception as e:
+                        logger.debug(f"Periodic daily notification check failed: {e}")
+                    latest_schedule = parse_schedule_times(getattr(latest_cfg.sync, "scheduled_sync_times", []))
+                    if latest_schedule != schedule:
+                        logger.info("Sync schedule changed; recalculating next scan time.")
+                        schedule = latest_schedule
+                        if schedule:
+                            next_run = next_scheduled_run(schedule)
+                            sync_state["next_scheduled_run"] = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
+                            deadline = next_run.timestamp() if next_run else deadline
+                        else:
+                            sync_state["next_scheduled_run"] = None
+                            deadline = min(deadline, time.time() + max(1, int(latest_cfg.sync.poll_interval_seconds)))
+                time.sleep(1)
+
         def daemon_worker():
             logger.info(f"Sync daemon started (polling every {cfg.sync.poll_interval_seconds}s)")
             watcher_sig = None
@@ -861,6 +908,7 @@ def create_app(
                 nonlocal watcher_sig
                 want = bool(
                     getattr(active_cfg.sync, "realtime_events_enabled", True)
+                    and not getattr(active_cfg.sync, "scheduled_sync_times", [])
                     and active_cfg.immich.enabled
                     and active_cfg.immich.api_key
                     and active_cfg.immich.url
@@ -891,12 +939,18 @@ def create_app(
                     new_w.start()
 
             try:
+                first_iteration = True
                 while not sync_state["stop_daemon_event"].is_set():
                     active_cfg = get_cfg() or cfg
                     interval = active_cfg.sync.poll_interval_seconds
+                    schedule = parse_schedule_times(getattr(active_cfg.sync, "scheduled_sync_times", []))
                     _ensure_watcher(active_cfg)
 
-                    if not sync_state["is_syncing"]:
+                    # In scheduled mode, a daemon (re)start waits for the next slot instead of scanning immediately.
+                    run_now = not (first_iteration and schedule)
+                    first_iteration = False
+
+                    if run_now and not sync_state["is_syncing"]:
                         sync_state["is_syncing"] = True
                         sync_state["is_paused"] = False
                         sync_state["stop_sync_event"].clear()
@@ -933,21 +987,8 @@ def create_app(
                                         log_broadcaster._loop,
                                     )
 
-                    # Sleep in short increments to respond quickly to stop requests or real-time events
-                    for sec in range(interval):
-                        if sync_state["stop_daemon_event"].is_set():
-                            break
-                        if sync_state["trigger_sync_event"].is_set():
-                            sync_state["trigger_sync_event"].clear()
-                            logger.info("Waking sync daemon immediately from real-time Immich event / webhook.")
-                            break
-                        if sec > 0 and sec % 60 == 0:
-                            try:
-                                latest_cfg = get_cfg() or active_cfg
-                                maybe_send_daily_summary(latest_cfg, SyncDatabase(db_path))
-                            except Exception as e:
-                                logger.debug(f"Periodic daily notification check failed: {e}")
-                        time.sleep(1)
+                    # Sleep in short increments to respond quickly to stop requests, webhooks, or schedule edits
+                    _wait_for_next_cycle(active_cfg, schedule, interval)
             finally:
                 existing_w = sync_state.get("event_watcher")
                 if existing_w is not None:

@@ -924,6 +924,24 @@ class TestSyncComponents(unittest.TestCase):
         engine.amazon.set_album_cover.assert_called_once_with("amz-alb-1", "amz-2")
         engine.icloud.add_to_album.assert_not_called()
 
+    def test_scheduled_sync_times_parsing_and_next_run(self):
+        import datetime
+        from src.schedule import parse_schedule_times, normalize_schedule_times, next_scheduled_run
+        from src.config import apply_env_overrides
+
+        self.assertEqual(normalize_schedule_times("14:00, 2:00;bad,25:00,14:00"), ["02:00", "14:00"])
+        self.assertEqual(SyncSettings(scheduled_sync_times=["14:00", "2:00"]).scheduled_sync_times, ["02:00", "14:00"])
+
+        times = parse_schedule_times(["02:00", "14:00"])
+        self.assertEqual(next_scheduled_run(times, datetime.datetime(2026, 11, 19, 1, 0)), datetime.datetime(2026, 11, 19, 2, 0))
+        self.assertEqual(next_scheduled_run(times, datetime.datetime(2026, 11, 19, 2, 0)), datetime.datetime(2026, 11, 19, 14, 0))
+        self.assertEqual(next_scheduled_run(times, datetime.datetime(2026, 11, 19, 20, 0)), datetime.datetime(2026, 11, 20, 2, 0))
+        self.assertIsNone(next_scheduled_run([], datetime.datetime(2026, 11, 19, 20, 0)))
+
+        data, applied = apply_env_overrides({}, {"SCHEDULED_SYNC_TIMES": "02:00,14:00"})
+        self.assertTrue(applied)
+        self.assertEqual(data["sync"]["scheduled_sync_times"], ["02:00", "14:00"])
+
 
 if __name__ == "__main__":
     unittest.main()

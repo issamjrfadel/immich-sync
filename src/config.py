@@ -3,7 +3,9 @@ import json
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Any, List
 from dotenv import dotenv_values
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from src.schedule import normalize_schedule_times
 
 class ImmichConfig(BaseModel):
     url: str = Field(..., description="Base URL of your Immich instance (e.g. http://192.168.1.100:2283)")
@@ -39,6 +41,15 @@ class SyncSettings(BaseModel):
     webhook_secret: Optional[str] = Field(None, description="Optional shared secret for POST /api/webhook/immich")
     download_temp_dir: str = Field("./.temp", description="Temporary staging directory for in-flight image downloads")
     poll_interval_seconds: int = Field(300, description="Polling interval in seconds for continuous daemon mode")
+    scheduled_sync_times: List[str] = Field(
+        default_factory=list,
+        description="Fixed local times (HH:MM) for daemon scans. When set, replaces interval polling and real-time event triggers.",
+    )
+
+    @field_validator("scheduled_sync_times", mode="before")
+    @classmethod
+    def _normalize_schedule(cls, v):
+        return normalize_schedule_times(v)
     dry_run: bool = Field(False, description="Preview actions without making destructive or write operations")
     enable_immich: bool = Field(True, description="Enable Immich as a sync source/destination")
     enable_icloud: bool = Field(True, description="Enable iCloud as a sync source/destination")
@@ -126,6 +137,7 @@ def apply_env_overrides(data: Dict[str, Any], env: Dict[str, str]) -> Tuple[Dict
         ("ICLOUD_SESSION_DIR", icloud, "session_dir", str),
         ("AMAZON_TLD", amazon, "tld", lambda s: s.lower()),
         ("POLL_INTERVAL_SECONDS", sync, "poll_interval_seconds", int),
+        ("SCHEDULED_SYNC_TIMES", sync, "scheduled_sync_times", normalize_schedule_times),
         ("MAX_DELETE_LIMIT", sync, "max_delete_limit", int),
         ("SYNC_DELETIONS", sync, "sync_deletions", _parse_bool),
         ("SYNC_ALBUMS", sync, "sync_albums", _parse_bool),
