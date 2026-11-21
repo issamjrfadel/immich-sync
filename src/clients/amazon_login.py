@@ -50,6 +50,48 @@ def _is_auth_challenge_url(url: str) -> bool:
     return any(marker in lower for marker in _AUTH_CHALLENGE_MARKERS)
 
 
+def _launch_amazon_context(playwright, user_data_dir: str, headless: bool):
+    """Launch a persistent Chromium/Chrome context against user_data_dir."""
+    is_linux = sys.platform.startswith("linux")
+    launch_args = [
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-blink-features=AutomationControlled",
+    ]
+    if is_linux:
+        launch_args.extend([
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--window-size=1280,800",
+            "--window-position=0,0",
+        ])
+        return playwright.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=headless,
+            args=launch_args,
+            viewport={"width": 1280, "height": 800},
+        )
+
+    if not headless:
+        launch_args.append("--start-maximized")
+    try:
+        return playwright.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            channel="chrome",
+            headless=headless,
+            args=launch_args,
+            viewport={"width": 1280, "height": 800} if headless else None,
+        )
+    except Exception as e_chrome:
+        logger.warning(f"Could not launch Chrome via channel='chrome' ({e_chrome}). Falling back to Chromium.")
+        return playwright.chromium.launch_persistent_context(
+            user_data_dir=user_data_dir,
+            headless=headless,
+            args=launch_args,
+            viewport={"width": 1280, "height": 800} if headless else None,
+        )
+
+
 def try_refresh_amazon_cookies_from_profile(
     tld: str = "ca",
     user_data_dir: Optional[str] = None,
@@ -70,24 +112,21 @@ def try_refresh_amazon_cookies_from_profile(
     except Exception as e:
         return False, {}, f"Playwright unavailable for automatic cookie refresh ({e})."
 
+    # Inside Docker/Xvfb (DISPLAY set on Linux), headless=False runs inside virtual :99 matching interactive login.
+    has_linux_display = sys.platform.startswith("linux") and bool(
+        os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+    )
+    use_headless = not has_linux_display
+
     target_url = f"https://www.amazon.{clean_tld}/photos"
-    logger.info(f"Attempting silent Amazon cookie refresh via saved browser profile at {target_url}...")
+    logger.info(
+        f"Attempting silent Amazon cookie refresh via saved browser profile at {target_url} "
+        f"(headless={use_headless})..."
+    )
 
     try:
         with sync_playwright() as p:
-            launch_args = [
-                "--no-first-run",
-                "--no-default-browser-check",
-            ]
-            if sys.platform.startswith("linux"):
-                launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
-
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(profile_dir),
-                headless=True,
-                args=launch_args,
-                viewport={"width": 1280, "height": 800},
-            )
+            context = _launch_amazon_context(p, str(profile_dir), headless=use_headless)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 try:
@@ -95,7 +134,10 @@ def try_refresh_amazon_cookies_from_profile(
                 except Exception as nav_err:
                     logger.debug(f"Amazon cookie refresh navigation notice: {nav_err}")
 
-                deadline = time.time() + max(5, timeout_seconds)
+                deadline = time.time() + max(8, timeout_seconds)
+                auth_first_seen: Optional[float] = None
+                auth_grace_seconds = 8.0
+
                 while time.time() < deadline:
                     cur_url = ""
                     try:
@@ -103,21 +145,26 @@ def try_refresh_amazon_cookies_from_profile(
                     except Exception:
                         pass
 
-                    if _is_auth_challenge_url(cur_url):
-                        return False, {}, "Amazon session requires interactive sign-in or verification; manual intervention is required."
+                    on_auth_url = _is_auth_challenge_url(cur_url)
+                    if on_auth_url:
+                        if auth_first_seen is None:
+                            auth_first_seen = time.time()
+                        elif time.time() - auth_first_seen >= auth_grace_seconds:
+                            return False, {}, "Amazon session requires interactive sign-in or verification; manual intervention is required."
+                    else:
+                        auth_first_seen = None
+                        cookie_dict = _extract_amazon_cookies(context.cookies(), clean_tld)
+                        if _has_required_amazon_tokens(cookie_dict, clean_tld):
+                            from src.clients.amazon import AmazonPhotosClient
+                            from src.config import AmazonConfig
 
-                    cookie_dict = _extract_amazon_cookies(context.cookies(), clean_tld)
-                    if _has_required_amazon_tokens(cookie_dict, clean_tld):
-                        from src.clients.amazon import AmazonPhotosClient
-                        from src.config import AmazonConfig
-
-                        try:
-                            client = AmazonPhotosClient(AmazonConfig(cookies=cookie_dict, tld=clean_tld))
-                            client.test_connection()
-                            logger.info(f"Successfully refreshed Amazon Photos cookies automatically for amazon.{clean_tld}.")
-                            return True, cookie_dict, f"Automatically refreshed Amazon Photos session (amazon.{clean_tld})."
-                        except Exception as verify_err:
-                            logger.debug(f"Auto-refresh cookie verification retry: {verify_err}")
+                            try:
+                                client = AmazonPhotosClient(AmazonConfig(cookies=cookie_dict, tld=clean_tld))
+                                client.test_connection()
+                                logger.info(f"Successfully refreshed Amazon Photos cookies automatically for amazon.{clean_tld}.")
+                                return True, cookie_dict, f"Automatically refreshed Amazon Photos session (amazon.{clean_tld})."
+                            except Exception as verify_err:
+                                logger.debug(f"Auto-refresh cookie verification retry: {verify_err}")
 
                     time.sleep(1.5)
 
@@ -232,44 +279,7 @@ class AmazonBrowserLogin:
 
         try:
             with sync_playwright() as p:
-                context = None
-                is_linux = sys.platform.startswith("linux")
-                launch_args = [
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-blink-features=AutomationControlled"
-                ]
-                if is_linux:
-                    launch_args.extend([
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--window-size=1280,800",
-                        "--window-position=0,0",
-                    ])
-                    context = p.chromium.launch_persistent_context(
-                        user_data_dir=self.user_data_dir,
-                        headless=False,
-                        args=launch_args,
-                        viewport={"width": 1280, "height": 800}
-                    )
-                else:
-                    launch_args.append("--start-maximized")
-                    try:
-                        context = p.chromium.launch_persistent_context(
-                            user_data_dir=self.user_data_dir,
-                            channel="chrome",
-                            headless=False,
-                            args=launch_args,
-                            viewport=None
-                        )
-                    except Exception as e_chrome:
-                        logger.warning(f"Could not launch Chrome via channel='chrome' ({e_chrome}). Falling back to Chromium.")
-                        context = p.chromium.launch_persistent_context(
-                            user_data_dir=self.user_data_dir,
-                            headless=False,
-                            args=launch_args,
-                            viewport=None
-                        )
+                context = _launch_amazon_context(p, self.user_data_dir, headless=False)
 
                 page = context.pages[0] if context.pages else context.new_page()
 

@@ -1052,6 +1052,59 @@ class TestSyncComponents(unittest.TestCase):
         self.assertEqual(parsed.scheduled_sync_times, ["03:00", "15:00"])
         self.assertFalse(parsed.realtime_events_enabled)
 
+    def test_auto_cookie_refresh_waits_out_sso_redirect_and_uses_xvfb_on_linux(self):
+        import os
+        import sys
+        import types
+        from src.clients.amazon_login import try_refresh_amazon_cookies_from_profile
+
+        profile_dir = Path(self.temp_dir.name) / "amz_profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        (profile_dir / "Cookies").write_text("dummy", encoding="utf-8")
+
+        fake_page = MagicMock()
+        # Tick 1 bounces through Amazon /ap/signin SSO redirect, Tick 2 lands cleanly back on /photos
+        type(fake_page).url = property(lambda s, _seq=iter([
+            "https://www.amazon.ca/ap/signin?openid.return_to=photos",
+            "https://www.amazon.ca/photos",
+        ]): next(_seq, "https://www.amazon.ca/photos"))
+
+        fake_ctx = MagicMock()
+        fake_ctx.pages = [fake_page]
+        fake_ctx.cookies.return_value = [
+            {"domain": ".amazon.ca", "name": "session-id", "value": "refreshed-sess"},
+            {"domain": ".amazon.ca", "name": "at-acbca", "value": "refreshed-at"},
+        ]
+
+        captured_headless = []
+
+        def fake_launch(*args, **kwargs):
+            captured_headless.append(kwargs.get("headless"))
+            return fake_ctx
+
+        fake_pw_instance = MagicMock()
+        fake_pw_instance.chromium.launch_persistent_context.side_effect = fake_launch
+        fake_pw_cm = MagicMock()
+        fake_pw_cm.__enter__.return_value = fake_pw_instance
+        fake_pw_mod = types.SimpleNamespace(sync_playwright=lambda: fake_pw_cm)
+
+        with patch.dict(sys.modules, {"playwright.sync_api": fake_pw_mod}), \
+             patch.object(sys, "platform", "linux"), \
+             patch.dict(os.environ, {"DISPLAY": ":99"}), \
+             patch("src.clients.amazon_login.time.sleep"), \
+             patch("src.clients.amazon.AmazonPhotosClient.test_connection", return_value={"root_id": "root-1"}):
+            ok, cookies, _ = try_refresh_amazon_cookies_from_profile(
+                tld="ca",
+                user_data_dir=str(profile_dir),
+                timeout_seconds=10,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(cookies.get("session-id"), "refreshed-sess")
+        self.assertEqual(cookies.get("at-acbca"), "refreshed-at")
+        # Matches Xvfb visible browser behavior on Linux Docker
+        self.assertEqual(captured_headless, [False])
+
 
 if __name__ == "__main__":
     unittest.main()
