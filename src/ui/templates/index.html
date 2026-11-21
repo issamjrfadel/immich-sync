@@ -650,39 +650,96 @@
               </label>
             </div>
             <div>
-              <label class="block text-slate-400 mb-1 font-medium">Daemon Polling Interval (seconds)</label>
-              <input type="number" id="cfg_sync_poll_interval" value="300" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none">
-              <span class="text-[11px] text-slate-500 mt-1 block">Fallback polling interval (also triggers instantly via Immich events when enabled).</span>
-            </div>
-            <div>
-              <label class="block text-slate-400 mb-1 font-medium">Scheduled Scan Times (HH:MM, local)</label>
-              <input type="text" id="cfg_sync_scheduled_times" placeholder="e.g. 02:00, 14:00" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none font-mono">
-              <span class="text-[11px] text-slate-500 mt-1 block">When set, the daemon only scans at these times. Replaces interval polling and real-time event triggers. Leave empty to disable.</span>
-            </div>
-            <div>
               <label class="block text-slate-400 mb-1 font-medium">Temporary Download Directory</label>
               <input type="text" id="cfg_sync_temp_dir" value="./.temp" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none font-mono">
               <span class="text-[11px] text-slate-500 mt-1 block">Staging path for downloading & hashing in-flight files.</span>
             </div>
-            <div class="lg:col-span-3 space-y-2 pt-2 border-t border-darkborder/70">
-              <div class="flex flex-wrap items-center justify-between gap-4">
-                <label class="flex items-center space-x-2 cursor-pointer select-none">
-                  <input type="checkbox" id="cfg_sync_realtime_events" checked class="rounded border-darkborder text-emerald-500 focus:ring-0 w-3.5 h-3.5 bg-slate-900">
-                  <span class="text-slate-200 font-medium">Real-time Immich WebSocket Sync</span>
-                </label>
-                <span class="text-[11px] text-slate-400 font-mono">Webhook: POST /api/webhook/immich</span>
-              </div>
-              <span class="text-[11px] text-slate-500 block">Listens to Immich <code class="text-slate-400">/api/socket.io</code> for uploads, trash, deletions, and updates instead of waiting for the next poll.</span>
-            </div>
-            <div class="pt-2 border-t border-darkborder/70">
-              <label class="block text-slate-400 mb-1 font-medium">Event Debounce (seconds)</label>
-              <input type="number" id="cfg_sync_event_debounce" value="15" min="0" max="300" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none">
-              <span class="text-[11px] text-slate-500 mt-1 block">Waits this long after the last Immich event to batch bursts cleanly.</span>
-            </div>
             <div class="lg:col-span-2 pt-2 border-t border-darkborder/70">
               <label class="block text-slate-400 mb-1 font-medium">Webhook Secret (optional, for <code class="text-slate-400">X-Webhook-Secret</code>)</label>
               <input type="password" id="cfg_sync_webhook_secret" placeholder="Optional shared secret for Immich Workflows" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none font-mono">
-              <span class="text-[11px] text-slate-500 mt-1 block">If set, external callers to <code class="text-slate-400">/api/webhook/immich</code> must send this in <code class="text-slate-400">X-Webhook-Secret</code>.</span>
+              <span class="text-[11px] text-slate-500 mt-1 block">Allows manual external triggers via <code class="text-slate-400">POST /api/webhook/immich</code> regardless of schedule mode.</span>
+            </div>
+
+            <!-- DAEMON TRIGGER MODE (CHOOSE 1 OF 3) -->
+            <div class="lg:col-span-3 pt-3 border-t border-darkborder/70 space-y-4">
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <label class="block text-slate-200 font-semibold text-xs">Daemon Sync Trigger Mode</label>
+                  <span class="text-[11px] text-slate-500">Choose how automatic background scans are triggered (pick one).</span>
+                </div>
+                <span class="text-[11px] text-slate-400 font-mono">Webhook: POST /api/webhook/immich</span>
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+                <label id="syncModeCard_realtime" onclick="selectSyncMode('realtime')" class="cursor-pointer rounded-xl border border-emerald-500/60 bg-emerald-950/20 p-3.5 transition-all flex items-start space-x-3">
+                  <input type="radio" name="cfg_sync_mode" value="realtime" checked class="mt-0.5 text-emerald-500 bg-slate-900 border-darkborder focus:ring-0">
+                  <div>
+                    <div class="font-semibold text-slate-100 flex items-center gap-1.5">
+                      <i class="fa-solid fa-bolt text-emerald-400 text-[11px]"></i>
+                      <span>Real-time Sync</span>
+                    </div>
+                    <p class="text-[11px] text-slate-400 mt-1 leading-relaxed">Listens to Immich <code class="text-slate-300">/api/socket.io</code> for instant upload/delete triggers plus fallback polling.</p>
+                  </div>
+                </label>
+
+                <label id="syncModeCard_polling" onclick="selectSyncMode('polling')" class="cursor-pointer rounded-xl border border-darkborder bg-slate-900/50 p-3.5 transition-all flex items-start space-x-3">
+                  <input type="radio" name="cfg_sync_mode" value="polling" class="mt-0.5 text-brand-500 bg-slate-900 border-darkborder focus:ring-0">
+                  <div>
+                    <div class="font-semibold text-slate-100 flex items-center gap-1.5">
+                      <i class="fa-solid fa-rotate text-brand-400 text-[11px]"></i>
+                      <span>Daemon Polling</span>
+                    </div>
+                    <p class="text-[11px] text-slate-400 mt-1 leading-relaxed">Runs on a repeating interval only. Photo deletes won't kick off immediate scans.</p>
+                  </div>
+                </label>
+
+                <label id="syncModeCard_scheduled" onclick="selectSyncMode('scheduled')" class="cursor-pointer rounded-xl border border-darkborder bg-slate-900/50 p-3.5 transition-all flex items-start space-x-3">
+                  <input type="radio" name="cfg_sync_mode" value="scheduled" class="mt-0.5 text-amber-500 bg-slate-900 border-darkborder focus:ring-0">
+                  <div>
+                    <div class="font-semibold text-slate-100 flex items-center gap-1.5">
+                      <i class="fa-regular fa-clock text-amber-400 text-[11px]"></i>
+                      <span>Scheduled Scan Times</span>
+                    </div>
+                    <p class="text-[11px] text-slate-400 mt-1 leading-relaxed">Runs only at chosen local clock times each day (no polling or event triggers).</p>
+                  </div>
+                </label>
+              </div>
+
+              <!-- MODE-SPECIFIC SETTINGS -->
+              <div class="bg-slate-900/60 border border-darkborder rounded-xl p-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div id="syncModeDebounceGroup">
+                  <label class="block text-slate-300 mb-1 font-medium">Event Debounce (seconds)</label>
+                  <input type="number" id="cfg_sync_event_debounce" value="15" min="0" max="300" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-emerald-500 focus:outline-none">
+                  <span class="text-[11px] text-slate-500 mt-1 block">Waits this long after the last Immich event to batch bursts before scanning.</span>
+                </div>
+
+                <div id="syncModePollingGroup">
+                  <label id="lblPollInterval" class="block text-slate-300 mb-1 font-medium">Fallback Polling Interval (seconds)</label>
+                  <input type="number" id="cfg_sync_poll_interval" value="300" min="15" class="w-full bg-slate-900 border border-darkborder rounded-lg p-2.5 text-slate-200 focus:border-brand-500 focus:outline-none">
+                  <div class="flex flex-wrap gap-1.5 mt-2">
+                    <button type="button" onclick="setPollPreset(300)" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]">5m</button>
+                    <button type="button" onclick="setPollPreset(900)" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]">15m</button>
+                    <button type="button" onclick="setPollPreset(3600)" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]">1h</button>
+                    <button type="button" onclick="setPollPreset(21600)" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]">6h</button>
+                    <button type="button" onclick="setPollPreset(43200)" class="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 text-[11px]">12h</button>
+                  </div>
+                </div>
+
+                <div id="syncModeScheduledGroup" class="md:col-span-2 hidden space-y-3">
+                  <div class="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <label class="block text-slate-300 font-medium">Daily Scan Times (Container Local Time)</label>
+                      <span class="text-[11px] text-slate-500">Pick one or more exact times per day. Set <code class="text-slate-400">TZ</code> in Docker to match your timezone.</span>
+                    </div>
+                    <div class="flex flex-wrap gap-2">
+                      <button type="button" onclick="setScheduledPreset(['02:00', '14:00'])" class="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 border border-darkborder text-slate-200 text-[11px]">Twice Daily (02:00 &amp; 14:00)</button>
+                      <button type="button" onclick="addScheduledTimeRow('')" class="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/40 text-amber-200 text-[11px] font-medium">+ Add Time</button>
+                    </div>
+                  </div>
+                  <div id="scheduledTimesList" class="flex flex-wrap gap-2"></div>
+                  <input type="hidden" id="cfg_sync_scheduled_times" value="">
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -1005,13 +1062,15 @@
           toggleBtn.classList.add('bg-brand-600');
           toggleCircle.classList.add('translate-x-6');
           const rtConnected = data.realtime_events && data.realtime_events.connected;
-          const hasSchedule = data.schedule && Array.isArray(data.schedule.times) && data.schedule.times.length > 0;
+          const activeMode = data.sync_mode || ((data.schedule && data.schedule.times && data.schedule.times.length > 0) ? 'scheduled' : (data.realtime_events && data.realtime_events.enabled ? 'realtime' : 'polling'));
           if (data.amazon_auth_paused) {
             statusText.innerText = 'Paused (Token Expired)';
-          } else if (hasSchedule) {
-            statusText.innerText = data.schedule.next_run ? `Scheduled (Next: ${data.schedule.next_run})` : 'Active (Scheduled)';
+          } else if (activeMode === 'scheduled') {
+            statusText.innerText = (data.schedule && data.schedule.next_run) ? `Scheduled (Next: ${data.schedule.next_run})` : 'Active (Scheduled)';
+          } else if (activeMode === 'polling') {
+            statusText.innerText = 'Active (Polling)';
           } else {
-            statusText.innerText = rtConnected ? 'Active (Live + Polling)' : 'Active (Polling)';
+            statusText.innerText = rtConnected ? 'Active (Real-time)' : 'Active (Real-time + Poll)';
           }
           statusText.classList.add('text-brand-400');
         } else {
@@ -1372,6 +1431,7 @@
     async function open2FAModal() {
       document.getElementById('modal2FA').classList.remove('hidden');
       document.getElementById('modal2FAMessage').innerText = "Connecting to iCloud to request verification code...";
+
       const payload = {};
       const appleIdEl = document.getElementById('cfg_icloud_apple_id');
       const passEl = document.getElementById('cfg_icloud_password');
@@ -1508,15 +1568,17 @@
         const optForceEl = document.getElementById('optForceDeletes');
         if (optForceEl) optForceEl.checked = cfg.sync?.force_deletes === true;
         document.getElementById('cfg_sync_poll_interval').value = cfg.sync?.poll_interval_seconds || 300;
-        const schedTimesEl = document.getElementById('cfg_sync_scheduled_times');
-        if (schedTimesEl) schedTimesEl.value = (cfg.sync?.scheduled_sync_times || []).join(', ');
+        const savedTimes = cfg.sync?.scheduled_sync_times || [];
+        renderScheduledTimeRows(savedTimes.length ? savedTimes : ['02:00', '14:00']);
         document.getElementById('cfg_sync_temp_dir').value = cfg.sync?.download_temp_dir || './.temp';
-        const rtEventsEl = document.getElementById('cfg_sync_realtime_events');
-        if (rtEventsEl) rtEventsEl.checked = cfg.sync?.realtime_events_enabled !== false;
         const debounceEl = document.getElementById('cfg_sync_event_debounce');
         if (debounceEl) debounceEl.value = cfg.sync?.event_debounce_seconds ?? 15;
         const whSecretEl = document.getElementById('cfg_sync_webhook_secret');
         if (whSecretEl) whSecretEl.value = cfg.sync?.webhook_secret || '';
+
+        const inferredMode = cfg.sync?.sync_mode
+          || (savedTimes.length > 0 ? 'scheduled' : (cfg.sync?.realtime_events_enabled === false ? 'polling' : 'realtime'));
+        selectSyncMode(inferredMode, false);
 
         const notifEnabledEl = document.getElementById('cfg_notifications_enabled');
         if (notifEnabledEl) notifEnabledEl.checked = cfg.notifications?.enabled === true;
@@ -1571,6 +1633,17 @@
       const notifUrls = rawNotifUrls.split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
       const notifHour = parseInt(document.getElementById('cfg_notifications_hour')?.value, 10);
 
+      const selectedMode = getSelectedSyncMode();
+      const scheduledTimes = getScheduledTimesFromUI();
+      if (selectedMode === 'scheduled' && scheduledTimes.length === 0) {
+        showToast('Please add at least one scan time for Scheduled mode.', 'error');
+        if (saveBtn) {
+          saveBtn.disabled = false;
+          saveBtn.innerHTML = `<i class="fa-solid fa-floppy-disk"></i> <span>Save Settings</span>`;
+        }
+        return;
+      }
+
       const payload = {
         immich: {
           url: document.getElementById('cfg_immich_url')?.value.trim() || "http://localhost:2283",
@@ -1601,7 +1674,8 @@
           sync_albums: true,
           max_delete_limit: isNaN(maxDeletes) ? 50 : maxDeletes,
           force_deletes: document.getElementById('cfg_sync_force_deletes')?.checked ?? document.getElementById('optForceDeletes')?.checked ?? false,
-          realtime_events_enabled: document.getElementById('cfg_sync_realtime_events')?.checked ?? true,
+          sync_mode: selectedMode,
+          realtime_events_enabled: selectedMode === 'realtime',
           event_debounce_seconds: (() => {
             const v = parseInt(document.getElementById('cfg_sync_event_debounce')?.value, 10);
             return isNaN(v) ? 15 : v;
@@ -1609,8 +1683,7 @@
           webhook_secret: document.getElementById('cfg_sync_webhook_secret')?.value.trim() || null,
           download_temp_dir: document.getElementById('cfg_sync_temp_dir')?.value.trim() || './.temp',
           poll_interval_seconds: isNaN(pollInterval) ? 300 : pollInterval,
-          scheduled_sync_times: (document.getElementById('cfg_sync_scheduled_times')?.value || '')
-            .split(/[\s,;]+/).map(s => s.trim()).filter(Boolean),
+          scheduled_sync_times: scheduledTimes,
           dry_run: false,
           enable_immich: immichEnabled,
           enable_icloud: icloudEnabled,
@@ -2099,6 +2172,101 @@
       } catch (err) {
         console.error('Error polling login status', err);
       }
+    }
+
+    function getSelectedSyncMode() {
+      const checked = document.querySelector('input[name="cfg_sync_mode"]:checked');
+      return checked ? checked.value : 'realtime';
+    }
+
+    function selectSyncMode(mode, ensureDefaultTimes = true) {
+      const validMode = ['realtime', 'polling', 'scheduled'].includes(mode) ? mode : 'realtime';
+      const styles = {
+        realtime: 'cursor-pointer rounded-xl border border-emerald-500/60 bg-emerald-950/20 p-3.5 transition-all flex items-start space-x-3',
+        polling: 'cursor-pointer rounded-xl border border-brand-500/60 bg-brand-950/20 p-3.5 transition-all flex items-start space-x-3',
+        scheduled: 'cursor-pointer rounded-xl border border-amber-500/60 bg-amber-950/20 p-3.5 transition-all flex items-start space-x-3',
+      };
+      const inactive = 'cursor-pointer rounded-xl border border-darkborder bg-slate-900/50 hover:border-slate-600 p-3.5 transition-all flex items-start space-x-3';
+
+      ['realtime', 'polling', 'scheduled'].forEach(m => {
+        const card = document.getElementById(`syncModeCard_${m}`);
+        const radio = document.querySelector(`input[name="cfg_sync_mode"][value="${m}"]`);
+        if (radio) radio.checked = (m === validMode);
+        if (card) card.className = (m === validMode) ? styles[m] : inactive;
+      });
+
+      const debounceGrp = document.getElementById('syncModeDebounceGroup');
+      const pollingGrp = document.getElementById('syncModePollingGroup');
+      const scheduledGrp = document.getElementById('syncModeScheduledGroup');
+      const pollLabel = document.getElementById('lblPollInterval');
+
+      if (debounceGrp) debounceGrp.classList.toggle('hidden', validMode !== 'realtime');
+      if (pollingGrp) pollingGrp.classList.toggle('hidden', validMode === 'scheduled');
+      if (scheduledGrp) scheduledGrp.classList.toggle('hidden', validMode !== 'scheduled');
+      if (pollLabel) {
+        pollLabel.innerText = validMode === 'realtime'
+          ? 'Fallback Polling Interval (seconds)'
+          : 'Daemon Polling Interval (seconds)';
+      }
+      if (validMode === 'scheduled' && ensureDefaultTimes && getScheduledTimesFromUI().length === 0) {
+        renderScheduledTimeRows(['02:00', '14:00']);
+      }
+    }
+
+    function setPollPreset(seconds) {
+      const el = document.getElementById('cfg_sync_poll_interval');
+      if (el) el.value = String(seconds);
+    }
+
+    function syncHiddenScheduledInput() {
+      const hidden = document.getElementById('cfg_sync_scheduled_times');
+      if (hidden) hidden.value = getScheduledTimesFromUI().join(', ');
+    }
+
+    function getScheduledTimesFromUI() {
+      const inputs = Array.from(document.querySelectorAll('#scheduledTimesList input[type="time"]'));
+      const vals = inputs.map(i => (i.value || '').trim()).filter(Boolean);
+      return Array.from(new Set(vals)).sort();
+    }
+
+    function addScheduledTimeRow(val = '02:00') {
+      const list = document.getElementById('scheduledTimesList');
+      if (!list) return;
+      const chip = document.createElement('div');
+      chip.className = 'flex items-center gap-1.5 bg-slate-950 border border-darkborder rounded-lg px-2.5 py-1.5';
+
+      const input = document.createElement('input');
+      input.type = 'time';
+      input.value = val || '12:00';
+      input.className = 'bg-transparent text-slate-100 text-xs font-mono focus:outline-none';
+      input.addEventListener('change', syncHiddenScheduledInput);
+
+      const rmBtn = document.createElement('button');
+      rmBtn.type = 'button';
+      rmBtn.title = 'Remove time';
+      rmBtn.className = 'text-slate-500 hover:text-rose-400 px-1 text-xs font-bold';
+      rmBtn.innerHTML = '&times;';
+      rmBtn.addEventListener('click', () => {
+        chip.remove();
+        syncHiddenScheduledInput();
+      });
+
+      chip.appendChild(input);
+      chip.appendChild(rmBtn);
+      list.appendChild(chip);
+      syncHiddenScheduledInput();
+    }
+
+    function renderScheduledTimeRows(times) {
+      const list = document.getElementById('scheduledTimesList');
+      if (!list) return;
+      list.innerHTML = '';
+      (times || []).forEach(t => addScheduledTimeRow(t));
+      syncHiddenScheduledInput();
+    }
+
+    function setScheduledPreset(times) {
+      renderScheduledTimeRows(times);
     }
 
     // Initialization

@@ -101,7 +101,7 @@ def format_daily_summary(
 
     if auth_pause:
         lines.append("")
-        lines.append("Action Required: Sync is paused until your Amazon Photos session token/cookies are updated. Once updated, pending items will reprocess automatically.")
+        lines.append("Manual Intervention Required: Automatic token refresh failed. Syncing is paused until you update your Amazon Photos session cookies. Once updated, pending items will reprocess automatically.")
 
     if error_details:
         lines.append("")
@@ -170,11 +170,11 @@ def maybe_send_error_alert(cfg: AppConfig, stats: Dict[str, Any]) -> bool:
     error_details = _normalize_error_details(stats.get("error_details"))
 
     if amazon_expired:
-        title = "Immich Multi-Sync Paused: Amazon Session Expired"
+        title = "Immich Multi-Sync Paused: Manual Intervention Required (Amazon Session Expired)"
         lines = [
-            "Sync stopped because your Amazon Photos session token/cookies expired.",
-            "Further processing is paused until you update your Amazon Photos cookies in Settings, Browser Login, or the 1-Click Bookmarklet.",
-            "Once updated, any pending photos, deletions, and albums will reprocess automatically.",
+            "Sync stopped because your Amazon Photos session token/cookies expired and automatic token renewal failed.",
+            "Manual intervention is required: further syncing is paused until you update your Amazon Photos cookies via Settings, In-App Browser Login, or the 1-Click Bookmarklet.",
+            "Once updated, pending photos, deletions, and albums will reprocess automatically.",
         ]
     else:
         title = f"Immich Multi-Sync Alert: {errors} Error(s)"

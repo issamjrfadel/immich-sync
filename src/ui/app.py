@@ -459,12 +459,15 @@ def create_app(
         active_pause = _get_active_amazon_pause(cfg)
         sync_state["amazon_auth_paused"] = bool(active_pause)
         sync_state["auth_paused_reason"] = active_pause["reason"] if active_pause else None
+        sync_mode = _effective_sync_mode(cfg)
 
         return {
             "is_syncing": sync_state["is_syncing"],
             "is_paused": sync_state["is_paused"],
             "amazon_auth_paused": bool(active_pause),
             "auth_paused_reason": active_pause["reason"] if active_pause else None,
+            "sync_mode": sync_mode,
+            "poll_interval_seconds": getattr(cfg.sync, "poll_interval_seconds", 300) if cfg else 300,
             "last_sync_time": sync_state["last_sync_time"],
             "last_stats": sync_state["last_stats"],
             "daemon_running": sync_state["daemon_running"],
@@ -478,13 +481,10 @@ def create_app(
             "force_deletes": getattr(cfg.sync, "force_deletes", False) if cfg else False,
             "schedule": {
                 "times": list(getattr(cfg.sync, "scheduled_sync_times", []) or []) if cfg else [],
-                "next_run": sync_state.get("next_scheduled_run"),
+                "next_run": sync_state.get("next_scheduled_run") if sync_mode == "scheduled" else None,
             },
             "realtime_events": {
-                "enabled": bool(
-                    getattr(cfg.sync, "realtime_events_enabled", True)
-                    and not getattr(cfg.sync, "scheduled_sync_times", [])
-                ) if cfg else True,
+                "enabled": sync_mode == "realtime",
                 "connected": bool(
                     sync_state.get("event_watcher")
                     and getattr(sync_state["event_watcher"], "is_connected", False)
@@ -531,6 +531,18 @@ def create_app(
         status_word = "enabled" if req.enabled else "disabled"
         logger.info(f"Host '{svc}' has been {status_word} via Web UI.")
         return {"success": True, "service": svc, "enabled": req.enabled, "message": f"{svc.capitalize()} {status_word}."}
+
+    def _effective_sync_mode(cfg: Optional[AppConfig]) -> str:
+        if not cfg:
+            return "realtime"
+        mode = getattr(cfg.sync, "sync_mode", None)
+        if mode in ("realtime", "polling", "scheduled"):
+            return mode
+        if getattr(cfg.sync, "scheduled_sync_times", []):
+            return "scheduled"
+        if not getattr(cfg.sync, "realtime_events_enabled", True):
+            return "polling"
+        return "realtime"
 
     def _get_or_init_cfg() -> AppConfig:
         cfg = get_cfg()
@@ -586,7 +598,14 @@ def create_app(
             sync_state["trigger_sync_event"].set()
         return True
 
-    def _persist_amazon_cookies(cookies: Dict[str, str], tld: str, details: str, connected: bool = False, source: str = "Amazon Login") -> bool:
+    def _persist_amazon_cookies(
+        cookies: Dict[str, str],
+        tld: str,
+        details: str,
+        connected: bool = False,
+        source: str = "Amazon Login",
+        trigger_reprocess: bool = True,
+    ) -> bool:
         cfg = _get_or_init_cfg()
         cfg.amazon.tld = tld
         cfg.amazon.cookies = cookies
@@ -598,7 +617,12 @@ def create_app(
         if connected:
             service_status_cache["amazon"]["connected"] = True
         service_status_cache["amazon"]["details"] = details
-        return _on_amazon_token_updated(cfg, source=source)
+        if trigger_reprocess:
+            return _on_amazon_token_updated(cfg, source=source)
+        SyncDatabase(db_path).clear_amazon_auth_paused()
+        sync_state["amazon_auth_paused"] = False
+        sync_state["auth_paused_reason"] = None
+        return False
 
     @app.post("/api/amazon/cookies")
     async def receive_amazon_cookies(payload: AmazonCookiesPayload):
@@ -797,6 +821,66 @@ def create_app(
         except Exception as e:
             logger.warning(f"Failed recording daily scan stats / notifications: {e}")
 
+    def _run_cycle_with_auto_refresh(
+        cycle_cfg: AppConfig,
+        limit: Optional[int] = None,
+        force_deletes: Optional[bool] = None,
+    ) -> tuple[AppConfig, Dict[str, Any]]:
+        """Run a sync cycle; on Amazon token expiry, try one automatic browser-profile refresh before pausing."""
+        effective_force = force_deletes if force_deletes is not None else cycle_cfg.sync.force_deletes
+        active_cfg = cycle_cfg
+
+        def _exec_cycle(cfg_to_run: AppConfig) -> Dict[str, Any]:
+            engine = SyncEngine(
+                cfg_to_run,
+                db_path=db_path,
+                progress_callback=handle_sync_progress,
+                stop_event=sync_state["stop_sync_event"],
+                pause_event=sync_state["pause_sync_event"],
+            )
+            return engine.run_sync_cycle(limit_intake=limit, force_deletes=effective_force)
+
+        stats = _exec_cycle(active_cfg)
+
+        if stats.get("amazon_session_expired") and not getattr(active_cfg.sync, "dry_run", False):
+            if not (sync_state["stop_sync_event"].is_set() or sync_state["stop_daemon_event"].is_set()):
+                logger.info("Amazon session expired — attempting automatic token refresh via saved browser profile...")
+                handle_sync_progress({
+                    "phase": "refreshing_auth",
+                    "phase_name": "Refreshing Amazon Token",
+                    "action": "Amazon token expired. Attempting automatic token refresh from browser profile...",
+                })
+                from src.clients.amazon_login import try_refresh_amazon_cookies_from_profile
+
+                ok, refreshed_cookies, refresh_msg = try_refresh_amazon_cookies_from_profile(active_cfg.amazon.tld)
+                if ok and refreshed_cookies:
+                    _persist_amazon_cookies(
+                        refreshed_cookies,
+                        active_cfg.amazon.tld,
+                        details=refresh_msg,
+                        connected=True,
+                        source="Auto Browser Refresh",
+                        trigger_reprocess=False,
+                    )
+                    active_cfg = get_cfg() or active_cfg
+                    logger.info("Amazon token automatically refreshed! Re-running sync cycle to process remaining items...")
+                    stats = _exec_cycle(active_cfg)
+                    if stats.get("amazon_session_expired"):
+                        details = stats.setdefault("error_details", [])
+                        note = "Auto-refreshed Amazon token still returned unauthorized (HTTP 401); manual intervention is required."
+                        if note not in details:
+                            details.insert(0, note)
+                else:
+                    logger.warning(f"Automatic Amazon token refresh did not succeed: {refresh_msg}")
+                    details = stats.setdefault("error_details", [])
+                    if refresh_msg and refresh_msg not in details:
+                        details.insert(0, refresh_msg)
+
+        sync_state["last_stats"] = stats
+        sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _record_cycle_and_notify(active_cfg, stats)
+        return active_cfg, stats
+
     def _start_manual_sync_worker(
         sync_cfg: AppConfig,
         limit: Optional[int] = None,
@@ -818,18 +902,7 @@ def create_app(
                 "action": "Initializing sync engine..."
             })
             try:
-                engine = SyncEngine(
-                    sync_cfg,
-                    db_path=db_path,
-                    progress_callback=handle_sync_progress,
-                    stop_event=sync_state["stop_sync_event"],
-                    pause_event=sync_state["pause_sync_event"]
-                )
-                effective_force_deletes = force_deletes if force_deletes is not None else sync_cfg.sync.force_deletes
-                stats = engine.run_sync_cycle(limit_intake=limit, force_deletes=effective_force_deletes)
-                sync_state["last_stats"] = stats
-                sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                _record_cycle_and_notify(sync_cfg, stats)
+                _run_cycle_with_auto_refresh(sync_cfg, limit=limit, force_deletes=force_deletes)
             except Exception as e:
                 logger.error(f"Manual sync failed: {e}", exc_info=True)
                 handle_sync_progress({
@@ -871,6 +944,14 @@ def create_app(
         cfg = get_cfg()
         if not cfg:
             raise HTTPException(status_code=400, detail="Configuration not found. Please setup config first.")
+
+        if req.enable_amazon is not False:
+            active_pause = _get_active_amazon_pause(cfg)
+            if active_pause:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Sync paused — manual intervention required: {active_pause['reason']}",
+                )
 
         sync_cfg = cfg.model_copy(deep=True)
         if req.dry_run:
@@ -938,16 +1019,20 @@ def create_app(
         sync_state["stop_daemon_event"].clear()
         sync_state["daemon_running"] = True
 
-        def _wait_for_next_cycle(active_cfg: AppConfig, schedule: list, interval: int, auth_paused: bool = False) -> None:
+        def _wait_for_next_cycle(active_cfg: AppConfig, mode: str, schedule: list, interval: int, auth_paused: bool = False) -> None:
             """Block until the next poll/scheduled slot, a webhook/token trigger, or a daemon stop."""
             if auth_paused:
                 sync_state["next_scheduled_run"] = None
                 deadline = float("inf")
-            elif schedule:
-                next_run = next_scheduled_run(schedule)
-                sync_state["next_scheduled_run"] = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
-                logger.info(f"Scheduled mode: next scan at {sync_state['next_scheduled_run']}.")
-                deadline = next_run.timestamp() if next_run else time.time() + interval
+            elif mode == "scheduled":
+                if schedule:
+                    next_run = next_scheduled_run(schedule)
+                    sync_state["next_scheduled_run"] = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
+                    logger.info(f"Scheduled mode: next scan at {sync_state['next_scheduled_run']}.")
+                    deadline = next_run.timestamp() if next_run else time.time() + 60
+                else:
+                    sync_state["next_scheduled_run"] = None
+                    deadline = time.time() + 60
             else:
                 sync_state["next_scheduled_run"] = None
                 deadline = time.time() + max(1, int(interval))
@@ -972,29 +1057,35 @@ def create_app(
                             logger.info("Amazon Photos auth pause cleared; waking daemon to reprocess pending items.")
                             return
                         continue
-                    latest_schedule = parse_schedule_times(getattr(latest_cfg.sync, "scheduled_sync_times", []))
-                    if latest_schedule != schedule:
-                        logger.info("Sync schedule changed; recalculating next scan time.")
+                    latest_mode = _effective_sync_mode(latest_cfg)
+                    latest_schedule = parse_schedule_times(getattr(latest_cfg.sync, "scheduled_sync_times", [])) if latest_mode == "scheduled" else []
+                    if latest_mode != mode or latest_schedule != schedule:
+                        logger.info(f"Sync schedule/mode changed ({mode} -> {latest_mode}); recalculating wait.")
+                        mode = latest_mode
                         schedule = latest_schedule
-                        if schedule:
-                            next_run = next_scheduled_run(schedule)
-                            sync_state["next_scheduled_run"] = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
-                            deadline = next_run.timestamp() if next_run else deadline
+                        if mode == "scheduled":
+                            if schedule:
+                                next_run = next_scheduled_run(schedule)
+                                sync_state["next_scheduled_run"] = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
+                                deadline = next_run.timestamp() if next_run else deadline
+                            else:
+                                sync_state["next_scheduled_run"] = None
+                                deadline = time.time() + 60
                         else:
                             sync_state["next_scheduled_run"] = None
                             deadline = min(deadline, time.time() + max(1, int(latest_cfg.sync.poll_interval_seconds)))
                 time.sleep(1)
 
         def daemon_worker():
-            logger.info(f"Sync daemon started (polling every {cfg.sync.poll_interval_seconds}s)")
+            logger.info(f"Sync daemon started (mode: {_effective_sync_mode(cfg)})")
             watcher_sig = None
             logged_auth_pause = False
 
-            def _ensure_watcher(active_cfg: AppConfig) -> None:
+            def _ensure_watcher(active_cfg: AppConfig, is_auth_paused: bool = False) -> None:
                 nonlocal watcher_sig
                 want = bool(
-                    getattr(active_cfg.sync, "realtime_events_enabled", True)
-                    and not getattr(active_cfg.sync, "scheduled_sync_times", [])
+                    _effective_sync_mode(active_cfg) == "realtime"
+                    and not is_auth_paused
                     and active_cfg.immich.enabled
                     and active_cfg.immich.api_key
                     and active_cfg.immich.url
@@ -1029,8 +1120,8 @@ def create_app(
                 while not sync_state["stop_daemon_event"].is_set():
                     active_cfg = get_cfg() or cfg
                     interval = active_cfg.sync.poll_interval_seconds
-                    schedule = parse_schedule_times(getattr(active_cfg.sync, "scheduled_sync_times", []))
-                    _ensure_watcher(active_cfg)
+                    mode = _effective_sync_mode(active_cfg)
+                    schedule = parse_schedule_times(getattr(active_cfg.sync, "scheduled_sync_times", [])) if mode == "scheduled" else []
 
                     db = SyncDatabase(db_path)
                     raw_pause = db.get_amazon_auth_pause()
@@ -1063,8 +1154,15 @@ def create_app(
                     else:
                         logged_auth_pause = False
 
-                    # In scheduled mode, a daemon (re)start waits for the next slot unless resuming from a token update.
-                    run_now = (not auth_paused) and (resumed_from_token_update or not (first_iteration and schedule))
+                    _ensure_watcher(active_cfg, is_auth_paused=auth_paused)
+
+                    # In scheduled mode, wait for next scheduled slot unless resuming from a token update; skip if no times set.
+                    if auth_paused:
+                        run_now = False
+                    elif mode == "scheduled":
+                        run_now = bool(resumed_from_token_update or (not first_iteration and schedule))
+                    else:
+                        run_now = True
                     first_iteration = False
 
                     if run_now and not sync_state["is_syncing"]:
@@ -1074,20 +1172,14 @@ def create_app(
                         sync_state["pause_sync_event"].clear()
                         sync_state["trigger_sync_event"].clear()
                         try:
-                            engine = SyncEngine(
+                            active_cfg, stats = _run_cycle_with_auto_refresh(
                                 active_cfg,
-                                db_path=db_path,
-                                progress_callback=handle_sync_progress,
-                                stop_event=sync_state["stop_sync_event"],
-                                pause_event=sync_state["pause_sync_event"],
+                                force_deletes=active_cfg.sync.force_deletes,
                             )
-                            stats = engine.run_sync_cycle(force_deletes=active_cfg.sync.force_deletes)
-                            sync_state["last_stats"] = stats
-                            sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                            _record_cycle_and_notify(active_cfg, stats)
                             if stats.get("amazon_session_expired"):
                                 auth_paused = True
                                 logged_auth_pause = True
+                                _ensure_watcher(active_cfg, is_auth_paused=True)
                         except Exception as e:
                             logger.error(f"Daemon cycle error: {e}")
                         finally:
@@ -1108,7 +1200,7 @@ def create_app(
                                     )
 
                     # Sleep in short increments to respond quickly to stop requests, webhooks, token updates, or schedule edits
-                    _wait_for_next_cycle(active_cfg, schedule, interval, auth_paused=auth_paused)
+                    _wait_for_next_cycle(active_cfg, mode, schedule, interval, auth_paused=auth_paused)
             finally:
                 existing_w = sync_state.get("event_watcher")
                 if existing_w is not None:
@@ -1423,28 +1515,36 @@ def create_app(
                 connect_kwargs["subprotocols"] = [chosen_proto]
             async with websockets.connect(upstream_url, **connect_kwargs) as upstream:
                 async def client_to_upstream():
-                    while True:
-                        msg = await websocket.receive()
-                        if msg.get("type") == "websocket.disconnect":
-                            break
-                        if msg.get("bytes") is not None:
-                            await upstream.send(msg["bytes"])
-                        elif msg.get("text") is not None:
-                            await upstream.send(msg["text"])
+                    try:
+                        while True:
+                            msg = await websocket.receive()
+                            if msg.get("type") == "websocket.disconnect":
+                                break
+                            if msg.get("bytes") is not None:
+                                await upstream.send(msg["bytes"])
+                            elif msg.get("text") is not None:
+                                await upstream.send(msg["text"])
+                    except (WebSocketDisconnect, asyncio.CancelledError):
+                        pass
 
                 async def upstream_to_client():
-                    async for data in upstream:
-                        if isinstance(data, (bytes, bytearray)):
-                            await websocket.send_bytes(bytes(data))
-                        else:
-                            await websocket.send_text(str(data))
+                    try:
+                        async for data in upstream:
+                            if isinstance(data, (bytes, bytearray)):
+                                await websocket.send_bytes(bytes(data))
+                            else:
+                                await websocket.send_text(str(data))
+                    except (WebSocketDisconnect, asyncio.CancelledError):
+                        pass
 
-                _, pending = await asyncio.wait(
-                    [asyncio.create_task(client_to_upstream()), asyncio.create_task(upstream_to_client())],
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
+                tasks = [
+                    asyncio.create_task(client_to_upstream()),
+                    asyncio.create_task(upstream_to_client()),
+                ]
+                _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
         except WebSocketDisconnect:
             pass
         except Exception as e:

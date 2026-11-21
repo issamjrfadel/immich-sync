@@ -1,9 +1,9 @@
 import os
 import json
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Any, List
+from typing import Dict, Optional, Tuple, Any, List, Literal
 from dotenv import dotenv_values
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.schedule import normalize_schedule_times
 
@@ -36,6 +36,10 @@ class SyncSettings(BaseModel):
     sync_videos_to_icloud: bool = Field(True, description="Whether to upload video files from Immich to iCloud Photos")
     max_delete_limit: int = Field(50, description="Safety guard: halt if more than X files would be deleted in one pass")
     force_deletes: bool = Field(False, description="Bypass max_delete_limit safety guard during deletion sync")
+    sync_mode: Literal["realtime", "polling", "scheduled"] = Field(
+        "realtime",
+        description="Daemon trigger mode: 'realtime' (Immich WebSocket + fallback poll), 'polling' (fixed interval), or 'scheduled' (fixed daily times).",
+    )
     realtime_events_enabled: bool = Field(True, description="Listen to Immich Socket.IO events for near-instant sync triggers")
     event_debounce_seconds: int = Field(15, ge=0, le=300, description="Seconds to wait after last Immich event before running sync")
     webhook_secret: Optional[str] = Field(None, description="Optional shared secret for POST /api/webhook/immich")
@@ -43,13 +47,36 @@ class SyncSettings(BaseModel):
     poll_interval_seconds: int = Field(300, description="Polling interval in seconds for continuous daemon mode")
     scheduled_sync_times: List[str] = Field(
         default_factory=list,
-        description="Fixed local times (HH:MM) for daemon scans. When set, replaces interval polling and real-time event triggers.",
+        description="Fixed local times (HH:MM) for daemon scans when sync_mode='scheduled'.",
     )
 
     @field_validator("scheduled_sync_times", mode="before")
     @classmethod
     def _normalize_schedule(cls, v):
         return normalize_schedule_times(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_sync_mode(cls, data: Any):
+        if not isinstance(data, dict):
+            return data
+        updated = dict(data)
+        raw_mode = updated.get("sync_mode")
+        if raw_mode is None or str(raw_mode).strip() == "":
+            if normalize_schedule_times(updated.get("scheduled_sync_times")):
+                updated["sync_mode"] = "scheduled"
+            elif updated.get("realtime_events_enabled") is False:
+                updated["sync_mode"] = "polling"
+            else:
+                updated["sync_mode"] = "realtime"
+        else:
+            updated["sync_mode"] = str(raw_mode).strip().lower()
+        return updated
+
+    @model_validator(mode="after")
+    def _sync_mode_flags(self):
+        self.realtime_events_enabled = (self.sync_mode == "realtime")
+        return self
     dry_run: bool = Field(False, description="Preview actions without making destructive or write operations")
     enable_immich: bool = Field(True, description="Enable Immich as a sync source/destination")
     enable_icloud: bool = Field(True, description="Enable iCloud as a sync source/destination")
@@ -136,6 +163,7 @@ def apply_env_overrides(data: Dict[str, Any], env: Dict[str, str]) -> Tuple[Dict
         ("ICLOUD_PASSWORD", icloud, "password", str),
         ("ICLOUD_SESSION_DIR", icloud, "session_dir", str),
         ("AMAZON_TLD", amazon, "tld", lambda s: s.lower()),
+        ("SYNC_MODE", sync, "sync_mode", lambda s: s.strip().lower()),
         ("POLL_INTERVAL_SECONDS", sync, "poll_interval_seconds", int),
         ("SCHEDULED_SYNC_TIMES", sync, "scheduled_sync_times", normalize_schedule_times),
         ("MAX_DELETE_LIMIT", sync, "max_delete_limit", int),

@@ -1005,6 +1005,8 @@ class TestSyncComponents(unittest.TestCase):
             self.assertTrue(sent)
             call_kwargs = mock_send.call_args.kwargs
             self.assertIn("Amazon Session Expired", call_kwargs["title"])
+            self.assertIn("Manual Intervention Required", call_kwargs["title"])
+            self.assertIn("Manual intervention is required", call_kwargs["body"])
             self.assertIn("Failure Details:", call_kwargs["body"])
             self.assertIn("401", call_kwargs["body"])
 
@@ -1020,8 +1022,35 @@ class TestSyncComponents(unittest.TestCase):
             auth_pause=self.db.get_amazon_auth_pause(),
         )
         self.assertIn("Paused — Amazon Session Expired", body)
+        self.assertIn("Manual Intervention Required:", body)
         self.assertIn("Failure Details:", body)
         self.assertIn("401", body)
+
+    def test_sync_mode_inference_and_env_override(self):
+        from src.config import apply_env_overrides
+
+        # Default is realtime
+        self.assertEqual(SyncSettings().sync_mode, "realtime")
+        self.assertTrue(SyncSettings().realtime_events_enabled)
+
+        # Scheduled times without explicit sync_mode infers scheduled and disables realtime_events_enabled
+        sched = SyncSettings(scheduled_sync_times=["02:00", "14:00"])
+        self.assertEqual(sched.sync_mode, "scheduled")
+        self.assertFalse(sched.realtime_events_enabled)
+
+        # Explicit polling keeps realtime_events_enabled=False while preserving saved scheduled times
+        poll = SyncSettings(sync_mode="polling", scheduled_sync_times=["02:00", "14:00"])
+        self.assertEqual(poll.sync_mode, "polling")
+        self.assertFalse(poll.realtime_events_enabled)
+        self.assertEqual(poll.scheduled_sync_times, ["02:00", "14:00"])
+
+        # Env override SYNC_MODE=scheduled works cleanly
+        data, applied = apply_env_overrides({}, {"SYNC_MODE": "scheduled", "SCHEDULED_SYNC_TIMES": "03:00,15:00"})
+        self.assertTrue(applied)
+        parsed = SyncSettings.model_validate(data["sync"])
+        self.assertEqual(parsed.sync_mode, "scheduled")
+        self.assertEqual(parsed.scheduled_sync_times, ["03:00", "15:00"])
+        self.assertFalse(parsed.realtime_events_enabled)
 
 
 if __name__ == "__main__":

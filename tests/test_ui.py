@@ -567,6 +567,136 @@ class TestUIDashboard(unittest.TestCase):
             sync_state["daemon_running"] = False
             sync_state["trigger_sync_event"].clear()
 
+    def test_novnc_websockify_proxy_handles_client_disconnect_cleanly(self):
+        import asyncio
+        import sys
+        import types
+        from unittest.mock import patch
+
+        class FakeUpstream:
+            def __init__(self):
+                self._sent = 0
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def send(self, data):
+                return None
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(0.02)
+                return b"rfb-frame"
+
+        fake_ws_mod = types.SimpleNamespace(connect=lambda *a, **kw: FakeUpstream())
+        unretrieved = []
+
+        orig_exc = asyncio.BaseEventLoop.default_exception_handler
+
+        def spy_handler(loop_self, context):
+            unretrieved.append(context)
+            return orig_exc(loop_self, context)
+
+        with patch.dict(sys.modules, {"websockets": fake_ws_mod}), \
+             patch.object(asyncio.BaseEventLoop, "default_exception_handler", spy_handler):
+            with self.client.websocket_connect("/novnc/websockify") as ws:
+                frame = ws.receive_bytes()
+                self.assertEqual(frame, b"rfb-frame")
+            import gc
+            gc.collect()
+
+        self.assertEqual(unretrieved, [])
+
+    def test_amazon_auto_refresh_recovers_and_failure_requires_manual_intervention(self):
+        import time
+        from unittest.mock import patch, MagicMock
+        from src.database import SyncDatabase
+        from src.ui.app import sync_state
+
+        cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        cfg["amazon"]["enabled"] = True
+        cfg["sync"]["enable_amazon"] = True
+        cfg["amazon"]["cookies"] = {"session-id": "old-sess", "at-acbca": "old-at"}
+        cfg["notifications"] = {"enabled": True, "apprise_urls": ["tgram://111:TOKEN/999"], "notify_on_error": False}
+        self.cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        # 1. Auto-refresh succeeds -> updates cookies, immediately re-runs cycle, clears pause, no manual alert
+        mock_engine_expired = MagicMock()
+        mock_engine_expired.run_sync_cycle.return_value = {
+            "immich_direct_synced": 0, "amazon_uploaded": 0, "icloud_uploaded": 0,
+            "icloud_ingested": 0, "immich_uploaded": 0, "deletions_synced": 0, "albums_synced": 0,
+            "errors": 1, "error_details": ["Amazon expired"], "amazon_session_expired": True,
+        }
+        mock_engine_recovered = MagicMock()
+        mock_engine_recovered.run_sync_cycle.return_value = {
+            "immich_direct_synced": 2, "amazon_uploaded": 2, "icloud_uploaded": 0,
+            "icloud_ingested": 0, "immich_uploaded": 0, "deletions_synced": 0, "albums_synced": 1,
+            "errors": 0, "error_details": [], "amazon_session_expired": False,
+        }
+
+        with patch("src.ui.app.SyncEngine", side_effect=[mock_engine_expired, mock_engine_recovered]), \
+             patch("src.clients.amazon_login.try_refresh_amazon_cookies_from_profile", return_value=(True, {"session-id": "auto-new", "at-acbca": "auto-at"}, "Refreshed OK")), \
+             patch("src.notifications.send_apprise_notification") as mock_tg:
+            resp = self.client.post("/api/sync/run", json={})
+            self.assertEqual(resp.status_code, 200)
+            for _ in range(40):
+                if not sync_state["is_syncing"]:
+                    break
+                time.sleep(0.05)
+
+            mock_tg.assert_not_called()
+            saved = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["amazon"]["cookies"]["session-id"], "auto-new")
+            self.assertFalse(self.client.get("/api/status").json()["amazon_auth_paused"])
+
+        # 2. Auto-refresh fails -> sends Telegram "Manual Intervention Required", pauses sync, blocks /api/sync/run (409)
+        mock_engine_still_expired = MagicMock()
+        mock_engine_still_expired.run_sync_cycle.return_value = {
+            "immich_direct_synced": 0, "amazon_uploaded": 0, "icloud_uploaded": 0,
+            "icloud_ingested": 0, "immich_uploaded": 0, "deletions_synced": 0, "albums_synced": 0,
+            "errors": 1, "error_details": ["Amazon expired"], "amazon_session_expired": True,
+        }
+
+        with patch("src.ui.app.SyncEngine", return_value=mock_engine_still_expired), \
+             patch("src.clients.amazon_login.try_refresh_amazon_cookies_from_profile", return_value=(False, {}, "Amazon requires interactive sign-in; manual intervention is required.")), \
+             patch("src.notifications.send_apprise_notification", return_value=(True, "ok")) as mock_tg:
+            resp = self.client.post("/api/sync/run", json={})
+            self.assertEqual(resp.status_code, 200)
+            for _ in range(40):
+                if not sync_state["is_syncing"]:
+                    break
+                time.sleep(0.05)
+
+            self.assertTrue(mock_tg.called)
+            tg_kwargs = mock_tg.call_args.kwargs
+            self.assertIn("Manual Intervention Required", tg_kwargs["title"])
+            self.assertIn("Manual intervention is required", tg_kwargs["body"])
+            self.assertTrue(self.client.get("/api/status").json()["amazon_auth_paused"])
+            self.assertEqual(self.client.post("/api/sync/run", json={}).status_code, 409)
+            SyncDatabase(self.db_path).clear_amazon_auth_paused()
+
+    def test_sync_mode_three_options_in_ui_and_status(self):
+        cfg = self.client.get("/api/config").json()
+        cfg["sync"]["sync_mode"] = "scheduled"
+        cfg["sync"]["scheduled_sync_times"] = ["02:00", "14:00"]
+        save_resp = self.client.post("/api/config", json=cfg)
+        self.assertEqual(save_resp.status_code, 200)
+
+        status = self.client.get("/api/status").json()
+        self.assertEqual(status["sync_mode"], "scheduled")
+        self.assertEqual(status["schedule"]["times"], ["02:00", "14:00"])
+        self.assertFalse(status["realtime_events"]["enabled"])
+
+        html = self.client.get("/").text
+        self.assertIn('name="cfg_sync_mode" value="realtime"', html)
+        self.assertIn('name="cfg_sync_mode" value="polling"', html)
+        self.assertIn('name="cfg_sync_mode" value="scheduled"', html)
+
 
 if __name__ == "__main__":
     unittest.main()

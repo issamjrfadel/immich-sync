@@ -9,9 +9,127 @@ import logging
 import time
 import threading
 from pathlib import Path
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, Optional, Callable, Tuple
 
 logger = logging.getLogger("immich_sync.amazon_login")
+
+_AUTH_CHALLENGE_MARKERS = (
+    "/signin",
+    "/ap/signin",
+    "openid.return_to",
+    "/ap/cvf",
+    "approval",
+    "captcha",
+    "/ap/mfa",
+)
+
+
+def _extract_amazon_cookies(all_cookies: list, tld: str) -> Dict[str, str]:
+    """Filter Playwright cookie list to Amazon domain entries."""
+    return {
+        c["name"]: c["value"]
+        for c in (all_cookies or [])
+        if (f"amazon.{tld}" in c.get("domain", "") or "amazon" in c.get("domain", ""))
+        and c.get("name")
+        and c.get("value")
+    }
+
+
+def _has_required_amazon_tokens(cookie_dict: Dict[str, str], tld: str) -> bool:
+    session_id = cookie_dict.get("session-id")
+    at_token = (
+        cookie_dict.get(f"at-acb{tld}")
+        or cookie_dict.get("at-main")
+        or cookie_dict.get("at")
+    )
+    return bool(session_id and at_token)
+
+
+def _is_auth_challenge_url(url: str) -> bool:
+    lower = (url or "").lower()
+    return any(marker in lower for marker in _AUTH_CHALLENGE_MARKERS)
+
+
+def try_refresh_amazon_cookies_from_profile(
+    tld: str = "ca",
+    user_data_dir: Optional[str] = None,
+    timeout_seconds: int = 20,
+) -> Tuple[bool, Dict[str, str], str]:
+    """
+    Attempt a non-interactive refresh of Amazon Photos cookies using an existing
+    saved Chromium profile (.amazon_browser_profile). Never attempts to solve
+    passwords, 2FA, or CAPTCHAs; returns (False, {}, reason) if manual sign-in is required.
+    """
+    clean_tld = (tld or "ca").lower().strip()
+    profile_dir = Path(user_data_dir or "./.amazon_browser_profile").resolve()
+    if not profile_dir.exists() or not any(profile_dir.iterdir()):
+        return False, {}, "No saved browser session profile found; manual intervention is required."
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as e:
+        return False, {}, f"Playwright unavailable for automatic cookie refresh ({e})."
+
+    target_url = f"https://www.amazon.{clean_tld}/photos"
+    logger.info(f"Attempting silent Amazon cookie refresh via saved browser profile at {target_url}...")
+
+    try:
+        with sync_playwright() as p:
+            launch_args = [
+                "--no-first-run",
+                "--no-default-browser-check",
+            ]
+            if sys.platform.startswith("linux"):
+                launch_args.extend(["--no-sandbox", "--disable-dev-shm-usage"])
+
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(profile_dir),
+                headless=True,
+                args=launch_args,
+                viewport={"width": 1280, "height": 800},
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                try:
+                    page.goto(target_url, wait_until="domcontentloaded", timeout=min(timeout_seconds, 20) * 1000)
+                except Exception as nav_err:
+                    logger.debug(f"Amazon cookie refresh navigation notice: {nav_err}")
+
+                deadline = time.time() + max(5, timeout_seconds)
+                while time.time() < deadline:
+                    cur_url = ""
+                    try:
+                        cur_url = page.url
+                    except Exception:
+                        pass
+
+                    if _is_auth_challenge_url(cur_url):
+                        return False, {}, "Amazon session requires interactive sign-in or verification; manual intervention is required."
+
+                    cookie_dict = _extract_amazon_cookies(context.cookies(), clean_tld)
+                    if _has_required_amazon_tokens(cookie_dict, clean_tld):
+                        from src.clients.amazon import AmazonPhotosClient
+                        from src.config import AmazonConfig
+
+                        try:
+                            client = AmazonPhotosClient(AmazonConfig(cookies=cookie_dict, tld=clean_tld))
+                            client.test_connection()
+                            logger.info(f"Successfully refreshed Amazon Photos cookies automatically for amazon.{clean_tld}.")
+                            return True, cookie_dict, f"Automatically refreshed Amazon Photos session (amazon.{clean_tld})."
+                        except Exception as verify_err:
+                            logger.debug(f"Auto-refresh cookie verification retry: {verify_err}")
+
+                    time.sleep(1.5)
+
+                return False, {}, "Timed out waiting for valid Amazon Photos cookies; manual intervention is required."
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.warning(f"Silent Amazon cookie refresh failed: {e}")
+        return False, {}, f"Automatic Amazon cookie refresh failed ({e}); manual intervention is required."
 
 def ensure_default_desktop() -> bool:
     """
@@ -191,30 +309,16 @@ class AmazonBrowserLogin:
 
                     # Check current page URL & cookies
                     try:
-                        all_cookies = context.cookies()
-                        cookie_dict = {
-                            c["name"]: c["value"]
-                            for c in all_cookies
-                            if f"amazon.{self.tld}" in c.get("domain", "") or "amazon" in c.get("domain", "")
-                        }
-
-                        session_id = cookie_dict.get("session-id")
-                        at_token = (
-                            cookie_dict.get(f"at-acb{self.tld}")
-                            or cookie_dict.get("at-main")
-                            or cookie_dict.get("at")
-                        )
+                        cookie_dict = _extract_amazon_cookies(context.cookies(), self.tld)
 
                         cur_url = ""
                         try:
-                            cur_url = page.url.lower()
+                            cur_url = page.url
                         except Exception:
                             pass
 
                         # Not in active signin or MFA challenge page
-                        is_still_signing_in = any(x in cur_url for x in ["/signin", "openid.return_to", "/ap/cvf", "approval"])
-
-                        if session_id and at_token and not is_still_signing_in:
+                        if _has_required_amazon_tokens(cookie_dict, self.tld) and not _is_auth_challenge_url(cur_url):
                             with self._lock:
                                 self.status["state"] = "verifying"
                                 self.status["message"] = "Session cookies detected! Verifying with Amazon Photos..."
