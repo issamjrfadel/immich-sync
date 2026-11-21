@@ -510,6 +510,63 @@ class TestUIDashboard(unittest.TestCase):
             sync_state["daemon_running"] = False
             sync_state["trigger_sync_event"].clear()
 
+    def test_amazon_auth_pause_blocks_until_token_update_then_reprocesses(self):
+        from src.ui.app import sync_state
+        from src.database import SyncDatabase
+        from src.clients.amazon import amazon_cookie_fingerprint
+
+        cfg = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        cfg["amazon"]["enabled"] = True
+        cfg["sync"]["enable_amazon"] = True
+        cfg["amazon"]["cookies"] = {"session-id": "old-expired-sess", "at-acbca": "old-at"}
+        self.cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        expired_fp = amazon_cookie_fingerprint(cfg["amazon"]["cookies"], cfg["amazon"].get("tld", "ca"))
+        db = SyncDatabase(self.db_path)
+        db.set_amazon_auth_paused("Amazon Photos session token expired (HTTP 401).", expired_fp)
+
+        # 1. Status reports paused state
+        st = self.client.get("/api/status").json()
+        self.assertTrue(st["amazon_auth_paused"])
+        self.assertIn("401", st["auth_paused_reason"])
+
+        # 2. Webhook refuses to trigger while token is still expired
+        sync_state["daemon_running"] = True
+        sync_state["trigger_sync_event"].clear()
+        try:
+            wh = self.client.post("/api/webhook/immich", json={"event": "AssetDelete"})
+            self.assertEqual(wh.status_code, 200)
+            self.assertEqual(wh.json()["status"], "paused_auth_expired")
+            self.assertFalse(sync_state["trigger_sync_event"].is_set())
+
+            # 3. Updating cookies via bookmarklet clears pause and immediately wakes daemon to reprocess
+            upd = self.client.post(
+                "/api/amazon/cookies",
+                json={"tld": "ca", "cookies": {"session-id": "fresh-sess-1", "at-acbca": "fresh-at-1"}},
+            )
+            self.assertEqual(upd.status_code, 200)
+            self.assertTrue(upd.json()["reprocessing"])
+            self.assertTrue(sync_state["trigger_sync_event"].is_set())
+            self.assertIsNone(db.get_amazon_auth_pause())
+            self.assertFalse(self.client.get("/api/status").json()["amazon_auth_paused"])
+
+            # 4. Updating cookies via Settings POST /api/config also clears pause and triggers reprocess
+            sync_state["trigger_sync_event"].clear()
+            current_cfg = self.client.get("/api/config").json()
+            fresh1_fp = amazon_cookie_fingerprint({"session-id": "fresh-sess-1", "at-acbca": "fresh-at-1"}, "ca")
+            db.set_amazon_auth_paused("Amazon Photos session token expired (HTTP 401).", fresh1_fp)
+
+            current_cfg["amazon"]["cookies"]["session-id"] = "fresh-sess-2"
+            current_cfg["amazon"]["cookies"]["at-acbca"] = "fresh-at-2"
+            save_resp = self.client.post("/api/config", json=current_cfg)
+            self.assertEqual(save_resp.status_code, 200)
+            self.assertTrue(save_resp.json()["reprocessing"])
+            self.assertTrue(sync_state["trigger_sync_event"].is_set())
+            self.assertIsNone(db.get_amazon_auth_pause())
+        finally:
+            sync_state["daemon_running"] = False
+            sync_state["trigger_sync_event"].clear()
+
 
 if __name__ == "__main__":
     unittest.main()

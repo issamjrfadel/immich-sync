@@ -112,6 +112,20 @@
       </div>
     </div>
 
+    <!-- AMAZON SESSION EXPIRED / AUTH PAUSED BANNER -->
+    <div id="authPausedBanner" class="hidden mb-6 bg-amber-950/70 border border-amber-500/50 text-amber-100 px-4 py-3 rounded-xl flex items-center justify-between gap-4 text-xs">
+      <div class="flex items-start space-x-3">
+        <i class="fa-solid fa-key text-amber-400 text-base mt-0.5 shrink-0"></i>
+        <div class="space-y-0.5">
+          <div class="font-bold text-amber-300">Sync Paused — Amazon Photos Token Expired</div>
+          <div id="authPausedText" class="text-amber-100/90 leading-relaxed">Update your Amazon Photos session cookies to resume. Pending items will reprocess automatically once updated.</div>
+        </div>
+      </div>
+      <button onclick="switchTab('settings')" class="shrink-0 bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 font-semibold px-3 py-1.5 rounded-lg transition-colors">
+        Update Token
+      </button>
+    </div>
+
     <!-- TAB 1: DASHBOARD -->
     <div id="tab-dashboard" class="space-y-6">
 
@@ -991,7 +1005,14 @@
           toggleBtn.classList.add('bg-brand-600');
           toggleCircle.classList.add('translate-x-6');
           const rtConnected = data.realtime_events && data.realtime_events.connected;
-          statusText.innerText = rtConnected ? 'Active (Live + Polling)' : 'Active (Polling)';
+          const hasSchedule = data.schedule && Array.isArray(data.schedule.times) && data.schedule.times.length > 0;
+          if (data.amazon_auth_paused) {
+            statusText.innerText = 'Paused (Token Expired)';
+          } else if (hasSchedule) {
+            statusText.innerText = data.schedule.next_run ? `Scheduled (Next: ${data.schedule.next_run})` : 'Active (Scheduled)';
+          } else {
+            statusText.innerText = rtConnected ? 'Active (Live + Polling)' : 'Active (Polling)';
+          }
           statusText.classList.add('text-brand-400');
         } else {
           toggleBtn.classList.add('bg-slate-700');
@@ -1038,6 +1059,17 @@
             storageBanner.classList.remove('hidden');
           } else {
             storageBanner.classList.add('hidden');
+          }
+        }
+
+        const authBanner = document.getElementById('authPausedBanner');
+        const authText = document.getElementById('authPausedText');
+        if (authBanner && authText) {
+          if (data.amazon_auth_paused) {
+            authText.innerText = (data.auth_paused_reason || 'Amazon Photos session expired.') + ' Pending items will reprocess automatically once updated.';
+            authBanner.classList.remove('hidden');
+          } else {
+            authBanner.classList.add('hidden');
           }
         }
       } catch (err) {

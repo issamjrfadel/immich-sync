@@ -28,7 +28,7 @@ from src.schedule import parse_schedule_times, next_scheduled_run
 from src.notifications import maybe_send_daily_summary, maybe_send_error_alert, send_test_notification
 from src.clients.immich import ImmichClient
 from src.clients.icloud import ICloudClient
-from src.clients.amazon import AmazonPhotosClient
+from src.clients.amazon import AmazonPhotosClient, amazon_cookie_fingerprint
 
 logger = logging.getLogger("immich_sync")
 
@@ -92,7 +92,9 @@ sync_state = {
     "stop_sync_event": threading.Event(),
     "pause_sync_event": threading.Event(),
     "event_watcher": None,
-    "pending_icloud_client": None
+    "pending_icloud_client": None,
+    "amazon_auth_paused": False,
+    "auth_paused_reason": None,
 }
 
 # Live Sync Progress Tracker
@@ -454,9 +456,15 @@ def create_app(
         service_status_cache["amazon"]["configured"] = bool(cfg and cfg.amazon.cookies.get("session-id"))
         service_status_cache["amazon"]["enabled"] = bool(cfg and cfg.sync.enable_amazon and getattr(cfg.amazon, "enabled", True))
 
+        active_pause = _get_active_amazon_pause(cfg)
+        sync_state["amazon_auth_paused"] = bool(active_pause)
+        sync_state["auth_paused_reason"] = active_pause["reason"] if active_pause else None
+
         return {
             "is_syncing": sync_state["is_syncing"],
             "is_paused": sync_state["is_paused"],
+            "amazon_auth_paused": bool(active_pause),
+            "auth_paused_reason": active_pause["reason"] if active_pause else None,
             "last_sync_time": sync_state["last_sync_time"],
             "last_stats": sync_state["last_stats"],
             "daemon_running": sync_state["daemon_running"],
@@ -538,7 +546,47 @@ def create_app(
             amazon=AmazonConfig(cookies={}, tld="ca"),
         )
 
-    def _persist_amazon_cookies(cookies: Dict[str, str], tld: str, details: str, connected: bool = False) -> None:
+    def _get_active_amazon_pause(cfg: Optional[AppConfig]) -> Optional[Dict[str, str]]:
+        pause = SyncDatabase(db_path).get_amazon_auth_pause()
+        if not pause:
+            return None
+        if cfg is not None:
+            if not (cfg.amazon.enabled and cfg.sync.enable_amazon):
+                return None
+            current_fp = amazon_cookie_fingerprint(cfg.amazon.cookies, cfg.amazon.tld)
+            if pause.get("cookie_fp") and current_fp != pause["cookie_fp"] and cfg.amazon.cookies.get("session-id"):
+                return None
+        return pause
+
+    def _on_amazon_token_updated(cfg: AppConfig, source: str) -> bool:
+        """Clear Amazon auth pause if cookies actually changed and immediately reprocess pending items."""
+        db = SyncDatabase(db_path)
+        pause = db.get_amazon_auth_pause()
+        if not pause:
+            sync_state["amazon_auth_paused"] = False
+            sync_state["auth_paused_reason"] = None
+            return False
+
+        new_fp = amazon_cookie_fingerprint(cfg.amazon.cookies, cfg.amazon.tld)
+        if not cfg.amazon.cookies.get("session-id") or (pause.get("cookie_fp") and new_fp == pause["cookie_fp"]):
+            return False
+
+        db.clear_amazon_auth_paused()
+        sync_state["amazon_auth_paused"] = False
+        sync_state["auth_paused_reason"] = None
+        logger.info(
+            f"Amazon Photos token updated via {source}. "
+            "Clearing auth pause and immediately reprocessing pending items..."
+        )
+        if sync_state["daemon_running"]:
+            sync_state["trigger_sync_event"].set()
+        elif not sync_state["is_syncing"]:
+            _start_manual_sync_worker(cfg.model_copy(deep=True))
+        else:
+            sync_state["trigger_sync_event"].set()
+        return True
+
+    def _persist_amazon_cookies(cookies: Dict[str, str], tld: str, details: str, connected: bool = False, source: str = "Amazon Login") -> bool:
         cfg = _get_or_init_cfg()
         cfg.amazon.tld = tld
         cfg.amazon.cookies = cookies
@@ -550,17 +598,22 @@ def create_app(
         if connected:
             service_status_cache["amazon"]["connected"] = True
         service_status_cache["amazon"]["details"] = details
+        return _on_amazon_token_updated(cfg, source=source)
 
     @app.post("/api/amazon/cookies")
     async def receive_amazon_cookies(payload: AmazonCookiesPayload):
         tld = (payload.tld or "ca").lower().strip()
-        _persist_amazon_cookies(
+        reprocessing = _persist_amazon_cookies(
             payload.cookies,
             tld,
             details=f"Cookies updated via 1-Click Bookmarklet (amazon.{tld})",
+            source="1-Click Bookmarklet",
         )
         logger.info(f"Fresh Amazon Photos cookies received and saved via 1-Click Bookmarklet for amazon.{tld}!")
-        return {"success": True, "message": f"Successfully synced fresh Amazon Photos cookies (amazon.{tld}) to Immich Multi-Sync!"}
+        msg = f"Successfully synced fresh Amazon Photos cookies (amazon.{tld}) to Immich Multi-Sync!"
+        if reprocessing:
+            msg += " Reprocessing pending items now."
+        return {"success": True, "reprocessing": reprocessing, "message": msg}
 
     @app.get("/api/amazon/cookie-import", response_class=HTMLResponse)
     async def cookie_import_fallback(data: str):
@@ -572,6 +625,7 @@ def create_app(
                 cookies,
                 tld,
                 details=f"Cookies updated via 1-Click Bookmarklet (amazon.{tld})",
+                source="1-Click Bookmarklet",
             )
             logger.info("Fresh Amazon Photos cookies imported via bookmarklet redirect!")
 
@@ -635,6 +689,7 @@ def create_app(
                 resolved_tld,
                 details=f"Connected to Amazon Photos (amazon.{resolved_tld})",
                 connected=True,
+                source="Browser Login",
             )
             logger.info(f"Fresh Amazon session cookies captured & saved for amazon.{resolved_tld}!")
             if log_broadcaster._loop and log_broadcaster.active_connections:
@@ -719,6 +774,23 @@ def create_app(
             return
         try:
             db = SyncDatabase(db_path)
+            if stats.get("amazon_session_expired"):
+                details = stats.get("error_details") or []
+                reason = details[0] if details else "Amazon Photos session token expired (HTTP 401)."
+                fp = amazon_cookie_fingerprint(cycle_cfg.amazon.cookies, cycle_cfg.amazon.tld)
+                db.set_amazon_auth_paused(reason, fp)
+                sync_state["amazon_auth_paused"] = True
+                sync_state["auth_paused_reason"] = reason
+                service_status_cache["amazon"]["connected"] = False
+                service_status_cache["amazon"]["details"] = reason
+                sync_progress["phase"] = "auth_expired"
+                sync_progress["phase_name"] = "Paused: Amazon Session Expired"
+                sync_progress["action"] = reason
+            elif cycle_cfg.amazon.enabled and cycle_cfg.sync.enable_amazon and int(stats.get("errors", 0) or 0) == 0:
+                if db.get_amazon_auth_pause():
+                    db.clear_amazon_auth_paused()
+                sync_state["amazon_auth_paused"] = False
+                sync_state["auth_paused_reason"] = None
             db.record_scan_stats(stats)
             maybe_send_error_alert(cycle_cfg, stats)
             maybe_send_daily_summary(cycle_cfg, db)
@@ -777,7 +849,7 @@ def create_app(
                     sync_progress["phase"] = "stopped"
                     sync_progress["phase_name"] = "Sync Stopped"
                     sync_progress["action"] = "Sync cycle was stopped by user."
-                elif sync_progress.get("phase") != "error":
+                elif sync_progress.get("phase") not in ("error", "auth_expired"):
                     sync_progress["percent"] = 100
                     sync_progress["phase"] = "completed"
                     sync_progress["phase_name"] = "Sync Complete"
@@ -840,6 +912,11 @@ def create_app(
             pass
 
         logger.info(f"Received Immich webhook trigger ({event_label}).")
+        active_pause = _get_active_amazon_pause(cfg)
+        if active_pause:
+            logger.warning(f"Skipping webhook trigger ({event_label}): {active_pause['reason']}")
+            return {"status": "paused_auth_expired", "event": event_label, "reason": active_pause["reason"]}
+
         sync_state["trigger_sync_event"].set()
         if sync_state["daemon_running"]:
             return {"status": "triggered", "mode": "daemon", "event": event_label}
@@ -861,9 +938,12 @@ def create_app(
         sync_state["stop_daemon_event"].clear()
         sync_state["daemon_running"] = True
 
-        def _wait_for_next_cycle(active_cfg: AppConfig, schedule: list, interval: int) -> None:
-            """Block until the next poll/scheduled slot, a webhook trigger, or a daemon stop."""
-            if schedule:
+        def _wait_for_next_cycle(active_cfg: AppConfig, schedule: list, interval: int, auth_paused: bool = False) -> None:
+            """Block until the next poll/scheduled slot, a webhook/token trigger, or a daemon stop."""
+            if auth_paused:
+                sync_state["next_scheduled_run"] = None
+                deadline = float("inf")
+            elif schedule:
                 next_run = next_scheduled_run(schedule)
                 sync_state["next_scheduled_run"] = next_run.strftime("%Y-%m-%d %H:%M") if next_run else None
                 logger.info(f"Scheduled mode: next scan at {sync_state['next_scheduled_run']}.")
@@ -878,7 +958,7 @@ def create_app(
                     return
                 if sync_state["trigger_sync_event"].is_set():
                     sync_state["trigger_sync_event"].clear()
-                    logger.info("Waking sync daemon immediately from Immich event / webhook.")
+                    logger.info("Waking sync daemon immediately from Immich event / webhook / token update.")
                     return
                 if time.time() - last_minute_check >= 60:
                     last_minute_check = time.time()
@@ -887,6 +967,11 @@ def create_app(
                         maybe_send_daily_summary(latest_cfg, SyncDatabase(db_path))
                     except Exception as e:
                         logger.debug(f"Periodic daily notification check failed: {e}")
+                    if auth_paused:
+                        if _get_active_amazon_pause(latest_cfg) is None:
+                            logger.info("Amazon Photos auth pause cleared; waking daemon to reprocess pending items.")
+                            return
+                        continue
                     latest_schedule = parse_schedule_times(getattr(latest_cfg.sync, "scheduled_sync_times", []))
                     if latest_schedule != schedule:
                         logger.info("Sync schedule changed; recalculating next scan time.")
@@ -903,6 +988,7 @@ def create_app(
         def daemon_worker():
             logger.info(f"Sync daemon started (polling every {cfg.sync.poll_interval_seconds}s)")
             watcher_sig = None
+            logged_auth_pause = False
 
             def _ensure_watcher(active_cfg: AppConfig) -> None:
                 nonlocal watcher_sig
@@ -946,8 +1032,39 @@ def create_app(
                     schedule = parse_schedule_times(getattr(active_cfg.sync, "scheduled_sync_times", []))
                     _ensure_watcher(active_cfg)
 
-                    # In scheduled mode, a daemon (re)start waits for the next slot instead of scanning immediately.
-                    run_now = not (first_iteration and schedule)
+                    db = SyncDatabase(db_path)
+                    raw_pause = db.get_amazon_auth_pause()
+                    amazon_enabled = bool(active_cfg.amazon.enabled and active_cfg.sync.enable_amazon)
+                    auth_paused = False
+                    resumed_from_token_update = False
+
+                    if raw_pause and amazon_enabled:
+                        current_fp = amazon_cookie_fingerprint(active_cfg.amazon.cookies, active_cfg.amazon.tld)
+                        if (
+                            raw_pause.get("cookie_fp")
+                            and current_fp != raw_pause["cookie_fp"]
+                            and active_cfg.amazon.cookies.get("session-id")
+                        ):
+                            db.clear_amazon_auth_paused()
+                            sync_state["amazon_auth_paused"] = False
+                            sync_state["auth_paused_reason"] = None
+                            logged_auth_pause = False
+                            resumed_from_token_update = True
+                            logger.info("Detected updated Amazon Photos cookies; immediately reprocessing pending items.")
+                        else:
+                            auth_paused = True
+                            sync_state["amazon_auth_paused"] = True
+                            sync_state["auth_paused_reason"] = raw_pause["reason"]
+                            service_status_cache["amazon"]["connected"] = False
+                            service_status_cache["amazon"]["details"] = raw_pause["reason"]
+                            if not logged_auth_pause:
+                                logger.warning(f"Sync daemon paused until Amazon token is updated: {raw_pause['reason']}")
+                                logged_auth_pause = True
+                    else:
+                        logged_auth_pause = False
+
+                    # In scheduled mode, a daemon (re)start waits for the next slot unless resuming from a token update.
+                    run_now = (not auth_paused) and (resumed_from_token_update or not (first_iteration and schedule))
                     first_iteration = False
 
                     if run_now and not sync_state["is_syncing"]:
@@ -968,6 +1085,9 @@ def create_app(
                             sync_state["last_stats"] = stats
                             sync_state["last_sync_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
                             _record_cycle_and_notify(active_cfg, stats)
+                            if stats.get("amazon_session_expired"):
+                                auth_paused = True
+                                logged_auth_pause = True
                         except Exception as e:
                             logger.error(f"Daemon cycle error: {e}")
                         finally:
@@ -987,8 +1107,8 @@ def create_app(
                                         log_broadcaster._loop,
                                     )
 
-                    # Sleep in short increments to respond quickly to stop requests, webhooks, or schedule edits
-                    _wait_for_next_cycle(active_cfg, schedule, interval)
+                    # Sleep in short increments to respond quickly to stop requests, webhooks, token updates, or schedule edits
+                    _wait_for_next_cycle(active_cfg, schedule, interval, auth_paused=auth_paused)
             finally:
                 existing_w = sync_state.get("event_watcher")
                 if existing_w is not None:
@@ -1109,7 +1229,9 @@ def create_app(
             service_status_cache["icloud"]["enabled"] = bool(validated.sync.enable_icloud and validated.icloud.enabled)
             service_status_cache["amazon"]["configured"] = bool(validated.amazon.cookies.get("session-id"))
             service_status_cache["amazon"]["enabled"] = bool(validated.sync.enable_amazon and validated.amazon.enabled)
-            return {"status": "saved", "message": "Settings saved successfully!"}
+            reprocessing = _on_amazon_token_updated(validated, source="Settings")
+            msg = "Settings saved! Fresh Amazon token detected — reprocessing pending items now." if reprocessing else "Settings saved successfully!"
+            return {"status": "saved", "reprocessing": reprocessing, "message": msg}
         except Exception as e:
             err_msg = str(e)
             if hasattr(e, "errors"):

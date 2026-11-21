@@ -1,4 +1,6 @@
 import time
+import json
+import hashlib
 import logging
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -8,6 +10,30 @@ from amazon_photos import AmazonPhotos
 from src.config import AmazonConfig
 
 logger = logging.getLogger("immich_sync.amazon")
+
+
+def amazon_cookie_fingerprint(cookies: Optional[Dict[str, str]], tld: str = "ca") -> str:
+    """Return a deterministic SHA-256 fingerprint of normalized Amazon session cookies and TLD."""
+    normalized = AmazonPhotosClient._normalize_cookies(cookies or {}, tld=tld)
+    clean = {str(k): str(v) for k, v in sorted(normalized.items()) if v}
+    payload = json.dumps({"tld": (tld or "ca").lower().strip(), "cookies": clean}, sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def is_amazon_auth_error(exc: Exception) -> bool:
+    """Return True if an exception indicates expired/unauthorized Amazon Photos cookies."""
+    if isinstance(exc, PermissionError):
+        return True
+    resp = getattr(exc, "response", None)
+    if getattr(resp, "status_code", None) in (401, 403):
+        return True
+    msg = str(exc).lower()
+    return (
+        "401" in msg
+        or "unauthorized" in msg
+        or "session cookies have expired" in msg
+        or "session expired" in msg
+    )
 
 class RegionalAmazonPhotos(AmazonPhotos):
     """
@@ -187,6 +213,8 @@ class AmazonPhotosClient:
             )
             return self._ap
         except Exception as e:
+            if is_amazon_auth_error(e):
+                self.session_expired = True
             logger.error(f"Failed to initialize Amazon Photos client for amazon.{self.tld}: {e}")
             raise
 
@@ -295,7 +323,11 @@ class AmazonPhotosClient:
                 self.session_expired = True
                 logger.warning("[Amazon Photos] Session cookies expired. Fast-failing Amazon checks for remaining photos.")
         except Exception as e:
-            logger.debug(f"MD5 search failed: {e}")
+            if is_amazon_auth_error(e):
+                self.session_expired = True
+                logger.warning("[Amazon Photos] Session cookies expired during MD5 lookup.")
+            else:
+                logger.debug(f"MD5 search failed: {e}")
         return []
 
     def find_by_md5(self, md5_hash: str) -> Optional[str]:
@@ -310,31 +342,45 @@ class AmazonPhotosClient:
         """Move photo/video nodes to Amazon Photos Trash."""
         if not node_ids:
             return True
-        ap = self._ensure_client()
+        if self.session_expired:
+            return False
         try:
+            ap = self._ensure_client()
             ap.trash(node_ids)
             return True
         except Exception as e:
-            logger.error(f"Failed to trash Amazon Photos nodes {node_ids}: {e}")
+            if is_amazon_auth_error(e):
+                self.session_expired = True
+                logger.warning("Amazon Photos session cookies expired while moving items to Trash.")
+            else:
+                logger.error(f"Failed to trash Amazon Photos nodes {node_ids}: {e}")
             return False
 
     def purge_nodes(self, node_ids: List[str]) -> bool:
         """Permanently delete photo/video nodes from Amazon Photos (bypassing trash/freeing quota)."""
         if not node_ids:
             return True
-        ap = self._ensure_client()
+        if self.session_expired:
+            return False
         try:
+            ap = self._ensure_client()
             ap.delete(node_ids)
             return True
         except Exception as e:
-            logger.error(f"Failed to permanently purge Amazon Photos nodes {node_ids}: {e}")
+            if is_amazon_auth_error(e):
+                self.session_expired = True
+                logger.warning("Amazon Photos session cookies expired while purging nodes.")
+            else:
+                logger.error(f"Failed to permanently purge Amazon Photos nodes {node_ids}: {e}")
             return False
 
     def create_album(self, album_name: str, node_ids: Optional[List[str]] = None, cover_node_id: Optional[str] = None) -> Optional[str]:
         """Create a visual collection / album in Amazon Photos."""
-        ap = self._ensure_client()
+        if self.session_expired:
+            return None
         safe_name = album_name.replace("/", " - ").strip()
         try:
+            ap = self._ensure_client()
             r = ap.client.post(
                 f"{ap.drive_url}/nodes",
                 json={
@@ -344,6 +390,10 @@ class AmazonPhotosClient:
                     "ContentType": "JSON",
                 }
             )
+            if r.status_code == 401:
+                self.session_expired = True
+                logger.warning(f"Amazon Photos session cookies expired while creating album '{safe_name}'.")
+                return None
             if r.status_code not in (200, 201):
                 logger.error(f"Failed to create Amazon Photos album '{safe_name}': HTTP {r.status_code} {r.text[:200]}")
                 return None
@@ -352,7 +402,11 @@ class AmazonPhotosClient:
                 self.add_to_album(album_id, node_ids, cover_node_id=cover_node_id)
             return album_id
         except Exception as e:
-            logger.error(f"Failed to create Amazon Photos album '{album_name}': {e}")
+            if is_amazon_auth_error(e):
+                self.session_expired = True
+                logger.warning(f"Amazon Photos session cookies expired while creating album '{album_name}'.")
+            else:
+                logger.error(f"Failed to create Amazon Photos album '{album_name}': {e}")
             return None
 
     def get_album_children_ids(self, album_id: str) -> Optional[set[str]]:
@@ -431,11 +485,15 @@ class AmazonPhotosClient:
             nid for nid in (node_ids or [])
             if nid and nid != "CONFLICT_EXISTING" and not str(nid).startswith("dry_run")
         ]
-        if not clean_ids or not album_id or self.session_expired:
+        if self.session_expired:
+            return False
+        if not clean_ids or not album_id:
             return True
-        ap = self._ensure_client()
         try:
+            ap = self._ensure_client()
             existing_ids = self.get_album_children_ids(album_id)
+            if self.session_expired:
+                return False
             if existing_ids is not None:
                 pending_ids = [nid for nid in clean_ids if nid not in existing_ids]
             else:
@@ -459,19 +517,21 @@ class AmazonPhotosClient:
                     time.sleep(0.3)
 
             cover = cover_node_id or clean_ids[0]
-            if cover:
+            if cover and not self.session_expired:
                 self.set_album_cover(album_id, cover)
-            return all_ok
+            return all_ok and not self.session_expired
         except Exception as e:
+            if is_amazon_auth_error(e):
+                self.session_expired = True
             logger.error(f"Failed to add nodes to Amazon Photos album {album_id}: {e}")
             return False
 
     def set_album_cover(self, album_id: str, cover_node_id: str) -> bool:
         """Set the cover photo for an Amazon Photos album."""
-        if not album_id or not cover_node_id:
+        if not album_id or not cover_node_id or self.session_expired:
             return False
-        ap = self._ensure_client()
         try:
+            ap = self._ensure_client()
             resp = ap.client.patch(
                 f"{ap.drive_url}/nodes/{album_id}",
                 json={
@@ -480,8 +540,14 @@ class AmazonPhotosClient:
                     "coverObject": {"id": cover_node_id}
                 }
             )
+            if resp.status_code == 401:
+                self.session_expired = True
+                logger.warning(f"Amazon Photos session cookies expired while setting cover for album {album_id}.")
+                return False
             return resp.status_code == 200
         except Exception as e:
+            if is_amazon_auth_error(e):
+                self.session_expired = True
             logger.debug(f"Could not set cover for album {album_id}: {e}")
             return False
 

@@ -942,6 +942,87 @@ class TestSyncComponents(unittest.TestCase):
         self.assertTrue(applied)
         self.assertEqual(data["sync"]["scheduled_sync_times"], ["02:00", "14:00"])
 
+    def test_amazon_session_expired_halts_processing_and_notifies_reason(self):
+        from src.config import NotificationConfig
+        from src.notifications import maybe_send_error_alert, format_daily_summary
+
+        cfg = AppConfig(
+            immich=ImmichConfig(url="http://localhost:2283", api_key="k"),
+            icloud=ICloudConfig(apple_id="test@example.com", enabled=False),
+            amazon=AmazonConfig(cookies={"session-id": "expired-sess"}, enabled=True),
+            sync=SyncSettings(
+                dry_run=False,
+                enable_immich=True,
+                enable_icloud=False,
+                enable_amazon=True,
+                sync_deletions=True,
+                sync_albums=True,
+            ),
+            notifications=NotificationConfig(
+                enabled=True,
+                apprise_urls=["tgram://111:TOKEN/999"],
+                notify_on_error=False,
+            ),
+        )
+        engine = SyncEngine(cfg, db_path=str(self.db_path))
+
+        engine.immich = MagicMock()
+        engine.immich.get_all_assets.return_value = [
+            {"id": "imm-1", "originalFileName": "one.jpg", "type": "IMAGE"},
+            {"id": "imm-2", "originalFileName": "two.jpg", "type": "IMAGE"},
+        ]
+
+        def fake_download(asset_id, dest_path):
+            Path(dest_path).write_bytes(f"data-{asset_id}".encode("utf-8"))
+
+        engine.immich.download_asset.side_effect = fake_download
+
+        engine.amazon = MagicMock()
+        engine.amazon.session_expired = False
+        engine.amazon.find_by_md5.return_value = None
+
+        def fail_401(*args, **kwargs):
+            engine.amazon.session_expired = True
+            raise PermissionError("Amazon Photos session cookies have expired (HTTP 401).")
+
+        engine.amazon.upload_photo.side_effect = fail_401
+
+        stats = engine.run_sync_cycle()
+
+        # Halts immediately on first 401: second photo, deletions, and albums are NOT attempted
+        self.assertTrue(stats["amazon_session_expired"])
+        self.assertGreaterEqual(stats["errors"], 1)
+        self.assertTrue(any("session token expired" in d.lower() for d in stats["error_details"]))
+        self.assertEqual(engine.immich.download_asset.call_count, 1)
+        engine.immich.get_albums.assert_not_called()
+        # Neither photo was marked synced, so both will reprocess once token is updated
+        self.assertIsNone(self.db.get_asset_by_immich_id("imm-1"))
+        self.assertIsNone(self.db.get_asset_by_immich_id("imm-2"))
+
+        # Immediate Telegram alert fires even when notify_on_error=False and includes reason
+        with patch("src.notifications.send_apprise_notification", return_value=(True, "ok")) as mock_send:
+            sent = maybe_send_error_alert(cfg, stats)
+            self.assertTrue(sent)
+            call_kwargs = mock_send.call_args.kwargs
+            self.assertIn("Amazon Session Expired", call_kwargs["title"])
+            self.assertIn("Failure Details:", call_kwargs["body"])
+            self.assertIn("401", call_kwargs["body"])
+
+        # Daily report persists error_details and shows paused status
+        self.db.record_scan_stats(stats, scan_date="2026-11-21")
+        self.db.set_amazon_auth_paused(stats["error_details"][0], "fp-expired")
+        daily = self.db.get_daily_scan_stats("2026-11-21")
+        self.assertTrue(any("401" in d for d in daily["error_details"]))
+        _, body = format_daily_summary(
+            daily,
+            total_active_assets=0,
+            total_albums=0,
+            auth_pause=self.db.get_amazon_auth_pause(),
+        )
+        self.assertIn("Paused — Amazon Session Expired", body)
+        self.assertIn("Failure Details:", body)
+        self.assertIn("401", body)
+
 
 if __name__ == "__main__":
     unittest.main()

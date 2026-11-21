@@ -13,7 +13,7 @@ from src.config import AppConfig
 from src.database import SyncDatabase
 from src.clients.immich import ImmichClient
 from src.clients.icloud import ICloudClient
-from src.clients.amazon import AmazonPhotosClient
+from src.clients.amazon import AmazonPhotosClient, is_amazon_auth_error
 from src.utils import (
     compute_hashes,
     format_bytes,
@@ -136,6 +136,51 @@ class SyncEngine:
             except Exception as e:
                 logger.debug(f"Progress callback error: {e}")
 
+    AMAZON_EXPIRED_DETAIL = (
+        "Amazon Photos session token expired (HTTP 401). "
+        "Sync paused until cookies/token are updated."
+    )
+
+    @staticmethod
+    def _record_error(stats: Optional[Dict[str, Any]], message: str, front: bool = False) -> None:
+        """Record a concise, deduplicated failure reason into stats['error_details']."""
+        if stats is None:
+            return
+        details = stats.setdefault("error_details", [])
+        clean = " ".join(str(message or "").split())[:220]
+        if not clean:
+            return
+        if clean in details:
+            if front:
+                details.remove(clean)
+                details.insert(0, clean)
+            return
+        if front:
+            details.insert(0, clean)
+        else:
+            details.append(clean)
+        del details[10:]
+
+    def _is_amazon_expired(self) -> bool:
+        return bool(self.is_amazon_enabled and getattr(self.amazon, "session_expired", False) is True)
+
+    def _handle_amazon_expired(self, stats: Optional[Dict[str, Any]]) -> None:
+        """Mark stats as auth-paused on Amazon session expiry and notify progress listeners."""
+        if stats is not None:
+            stats["amazon_session_expired"] = True
+            if int(stats.get("errors", 0) or 0) <= 0:
+                stats["errors"] = 1
+            self._record_error(stats, self.AMAZON_EXPIRED_DETAIL, front=True)
+        self.report_progress(
+            0,
+            "auth_expired",
+            "Paused: Amazon Session Expired",
+            0,
+            0,
+            "",
+            self.AMAZON_EXPIRED_DETAIL,
+        )
+
     def run_sync_cycle(self, limit_intake: Optional[int] = None, force_deletes: bool = False) -> Dict[str, Any]:
         """
         Executes a synchronization cycle:
@@ -154,7 +199,9 @@ class SyncEngine:
             "immich_direct_synced": 0,
             "deletions_synced": 0,
             "albums_synced": 0,
-            "errors": 0
+            "errors": 0,
+            "error_details": [],
+            "amazon_session_expired": False,
         }
 
         logger.info("=== Starting Sync Cycle ===")
@@ -180,10 +227,16 @@ class SyncEngine:
             except Exception as e:
                 logger.error(f"Error during iCloud intake: {e}", exc_info=True)
                 stats["errors"] += 1
+                self._record_error(stats, f"iCloud intake failed: {e}")
         elif is_one_way:
             logger.info("Step 1: One-way sync active (Immich is master). Skipping iCloud-to-Immich ingestion.")
         else:
             logger.info("Step 1: iCloud sync is disabled. Skipping iCloud intake.")
+
+        if self._is_amazon_expired():
+            logger.warning("Stopping sync cycle: Amazon Photos session token expired.")
+            self._handle_amazon_expired(stats)
+            return stats
 
         # -------------------------------------------------------------
         # STEP 2: Sync Direct Immich Additions -> Amazon Photos & iCloud
@@ -201,8 +254,18 @@ class SyncEngine:
             except Exception as e:
                 logger.error(f"Error syncing Immich assets: {e}", exc_info=True)
                 stats["errors"] += 1
+                if is_amazon_auth_error(e):
+                    self.amazon.session_expired = True
+                    self._handle_amazon_expired(stats)
+                else:
+                    self._record_error(stats, f"Immich mirroring failed: {e}")
         else:
             logger.info("Step 2: Immich sync is disabled. Skipping Immich intake.")
+
+        if self._is_amazon_expired():
+            logger.warning("Stopping sync cycle after Step 2: Amazon Photos session token expired.")
+            self._handle_amazon_expired(stats)
+            return stats
 
         # -------------------------------------------------------------
         # STEP 3: Sync Deletions (Immich -> Amazon & iCloud)
@@ -216,14 +279,24 @@ class SyncEngine:
             try:
                 logger.info("Step 3: Checking for deletions in Immich to propagate...")
                 self.report_progress(70, "deletions", "Checking Deletions", 0, 0, "", "Comparing Immich catalog with tracked database...")
-                stats["deletions_synced"] = self._sync_deletions(force=force_deletes)
+                stats["deletions_synced"] = self._sync_deletions(force=force_deletes, stats=stats)
             except Exception as e:
                 logger.error(f"Error during deletion sync: {e}", exc_info=True)
                 stats["errors"] += 1
+                if is_amazon_auth_error(e):
+                    self.amazon.session_expired = True
+                    self._handle_amazon_expired(stats)
+                else:
+                    self._record_error(stats, f"Deletion sync failed: {e}")
         elif not self.is_immich_enabled:
             logger.info("Step 3: Immich is disabled. Skipping deletion sync.")
         else:
             logger.info("Step 3: Deletion sync disabled in configuration.")
+
+        if self._is_amazon_expired():
+            logger.warning("Stopping sync cycle after Step 3: Amazon Photos session token expired.")
+            self._handle_amazon_expired(stats)
+            return stats
 
         # -------------------------------------------------------------
         # STEP 4: Sync Albums (Immich -> Amazon & iCloud)
@@ -237,14 +310,24 @@ class SyncEngine:
             try:
                 logger.info("Step 4: Synchronizing Albums from Immich...")
                 self.report_progress(90, "albums", "Syncing Albums", 0, 0, "", "Fetching albums from Immich...")
-                stats["albums_synced"] = self._sync_albums()
+                stats["albums_synced"] = self._sync_albums(stats=stats)
             except Exception as e:
                 logger.error(f"Error during album sync: {e}", exc_info=True)
                 stats["errors"] += 1
+                if is_amazon_auth_error(e):
+                    self.amazon.session_expired = True
+                    self._handle_amazon_expired(stats)
+                else:
+                    self._record_error(stats, f"Album sync failed: {e}")
         elif not self.is_immich_enabled:
             logger.info("Step 4: Immich is disabled. Skipping album sync.")
         else:
             logger.info("Step 4: Album sync disabled in configuration.")
+
+        if self._is_amazon_expired():
+            logger.warning("Sync cycle halted during Step 4: Amazon Photos session token expired.")
+            self._handle_amazon_expired(stats)
+            return stats
 
         if self.stop_event and self.stop_event.is_set():
             logger.info("Sync cycle stopped by user.")
@@ -345,6 +428,11 @@ class SyncEngine:
             except Exception as e:
                 logger.error(f"Failed processing iCloud photo {filename}: {e}")
                 stats["errors"] += 1
+                if is_amazon_auth_error(e) or self._is_amazon_expired():
+                    self.amazon.session_expired = True
+                    self._handle_amazon_expired(stats)
+                    break
+                self._record_error(stats, f"iCloud photo {filename}: {e}")
             finally:
                 if staging_path.exists():
                     try:
@@ -408,8 +496,10 @@ class SyncEngine:
         logger.info(f"Found {total_items} Immich assets that need mirroring to targets...")
 
         for idx, (asset, existing, needs_amazon, needs_icloud, is_video) in enumerate(items_to_sync):
-            if needs_amazon and getattr(self.amazon, "session_expired", False):
-                needs_amazon = False
+            if self._is_amazon_expired():
+                logger.warning(f"Halting Immich photo mirroring at {idx + 1}/{total_items}: Amazon Photos session expired.")
+                self._handle_amazon_expired(stats)
+                break
 
             if not needs_amazon and not needs_icloud:
                 continue
@@ -493,6 +583,11 @@ class SyncEngine:
             except Exception as e:
                 logger.error(f"Failed syncing Immich asset {filename} to Amazon/iCloud: {e}")
                 stats["errors"] += 1
+                if is_amazon_auth_error(e) or self._is_amazon_expired():
+                    self.amazon.session_expired = True
+                    self._handle_amazon_expired(stats)
+                    break
+                self._record_error(stats, f"Asset '{filename}': {e}")
             finally:
                 if staging_path.exists():
                     try:
@@ -512,7 +607,7 @@ class SyncEngine:
         self.report_progress(70, "immich_sync", "Photo Mirroring Complete", total_items, total_items, "", f"Mirrored {count} assets from Immich.")
         return count
 
-    def _sync_deletions(self, force: bool = False) -> int:
+    def _sync_deletions(self, force: bool = False, stats: Optional[Dict[str, Any]] = None) -> int:
         active_assets_immich = self.immich.get_all_assets()
         ignore_hidden_and_locked = getattr(self.config.sync, "ignore_hidden_and_locked", True)
 
@@ -531,6 +626,9 @@ class SyncEngine:
         )
         if self.is_amazon_enabled and not sync_videos_to_amz:
             for a in tracked_active:
+                if self._is_amazon_expired():
+                    self._handle_amazon_expired(stats)
+                    return 0
                 fn = a.get("filename") or ""
                 if self.check_pause_and_stop(fn, 70, 0, len(tracked_active)):
                     return 0
@@ -538,10 +636,13 @@ class SyncEngine:
                 if amz_id and amz_id != "CONFLICT_EXISTING" and not amz_id.startswith("dry_run") and is_video_file(fn):
                     logger.info(f"Purging video '{fn}' from Amazon Photos (video sync disabled)...")
                     if not self.dry_run:
-                        self.amazon.purge_nodes([amz_id])
-                        with self.db._get_connection() as conn:
-                            conn.execute("UPDATE assets SET amazon_id = NULL WHERE id = ?", (a["id"],))
-                            conn.commit()
+                        if self.amazon.purge_nodes([amz_id]):
+                            with self.db._get_connection() as conn:
+                                conn.execute("UPDATE assets SET amazon_id = NULL WHERE id = ?", (a["id"],))
+                                conn.commit()
+                        elif self._is_amazon_expired():
+                            self._handle_amazon_expired(stats)
+                            return 0
 
         deletion_candidates = [
             a for a in tracked_active
@@ -611,6 +712,10 @@ class SyncEngine:
 
         synced_count = 0
         for idx, asset in enumerate(deletion_candidates):
+            if self._is_amazon_expired():
+                logger.warning(f"Halting deletion sync at {idx + 1}/{num_deletions}: Amazon Photos session expired.")
+                self._handle_amazon_expired(stats)
+                break
             immich_id = asset["immich_id"]
             amazon_id = asset.get("amazon_id")
             icloud_id = asset.get("icloud_id")
@@ -634,6 +739,9 @@ class SyncEngine:
                     else:
                         logger.error(f"  -> Failed to trash '{filename}' in Amazon Photos.")
                         amazon_ok = False
+                        if self._is_amazon_expired():
+                            self._handle_amazon_expired(stats)
+                            break
                 else:
                     logger.info(f"  -> [DRY RUN] Would trash '{filename}' in Amazon Photos.")
 
@@ -663,7 +771,8 @@ class SyncEngine:
 
         offset = len(deletion_candidates)
         for idx, ta in enumerate(untracked_trashed):
-            if getattr(self.amazon, "session_expired", False):
+            if self._is_amazon_expired():
+                self._handle_amazon_expired(stats)
                 break
             filename = ta.get("originalFileName", ta.get("id", "asset"))
             overall_idx = offset + idx
@@ -683,6 +792,9 @@ class SyncEngine:
             )
             if self._trash_untracked_immich_asset(ta):
                 synced_count += 1
+            if self._is_amazon_expired():
+                self._handle_amazon_expired(stats)
+                break
 
         if self.stop_event and self.stop_event.is_set():
             return synced_count
@@ -714,8 +826,12 @@ class SyncEngine:
             file_size = staging_path.stat().st_size
 
             nodes = self.amazon.find_nodes_by_md5(md5)
+            if self._is_amazon_expired():
+                return False
             if not nodes:
                 fallback_id = self.amazon.find_by_md5(md5)
+                if self._is_amazon_expired():
+                    return False
                 if fallback_id:
                     nodes = [{"id": fallback_id, "status": "AVAILABLE"}]
 
@@ -977,7 +1093,7 @@ class SyncEngine:
 
         return [icid for icid in unique_candidates if icid in synced_set], initialized, all_ok, changed
 
-    def _sync_albums(self) -> int:
+    def _sync_albums(self, stats: Optional[Dict[str, Any]] = None) -> int:
         immich_albums = self.immich.get_albums()
         synced_albums = 0
         total_albums = len(immich_albums)
@@ -989,6 +1105,10 @@ class SyncEngine:
         ignore_hidden_and_locked = getattr(self.config.sync, "ignore_hidden_and_locked", True)
 
         for idx, album in enumerate(immich_albums):
+            if self._is_amazon_expired():
+                logger.warning(f"Halting album sync at {idx + 1}/{total_albums}: Amazon Photos session expired.")
+                self._handle_amazon_expired(stats)
+                break
             immich_album_id = album.get("id")
             album_name = album.get("albumName", "Untitled Album")
 
@@ -1031,6 +1151,11 @@ class SyncEngine:
             amazon_album_id, amz_synced, amz_cover, amz_checked, amz_changed = self._sync_album_to_amazon(
                 album_name, amazon_album_id, amazon_node_ids, cover_node_id, prev_state
             )
+
+            if self._is_amazon_expired():
+                logger.warning(f"Halting album sync on '{album_name}': Amazon Photos session expired.")
+                self._handle_amazon_expired(stats)
+                break
 
             icloud_album_id = db_album.get("icloud_id") if db_album else None
             icloud_synced, icloud_init, icloud_checked, icloud_changed = self._sync_album_to_icloud(

@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import datetime
 from pathlib import Path
@@ -69,8 +70,17 @@ class SyncDatabase:
                     deletions_synced INTEGER DEFAULT 0,
                     albums_synced INTEGER DEFAULT 0,
                     errors INTEGER DEFAULT 0,
+                    error_details TEXT,
                     last_scan_at TIMESTAMP,
                     notified_at TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS app_state (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TIMESTAMP
                 )
             """)
 
@@ -78,6 +88,11 @@ class SyncDatabase:
             album_cols = {row[1] for row in cursor.fetchall()}
             if "synced_state" not in album_cols:
                 cursor.execute("ALTER TABLE albums ADD COLUMN synced_state TEXT")
+
+            cursor.execute("PRAGMA table_info(daily_scan_stats)")
+            stats_cols = {row[1] for row in cursor.fetchall()}
+            if "error_details" not in stats_cols:
+                cursor.execute("ALTER TABLE daily_scan_stats ADD COLUMN error_details TEXT")
 
             # Indexes
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_assets_sha1 ON assets(sha1)")
@@ -220,18 +235,42 @@ class SyncDatabase:
     def _today_key(scan_date: Optional[str] = None) -> str:
         return scan_date or datetime.date.today().isoformat()
 
+    @staticmethod
+    def _parse_error_details(raw: Any) -> List[str]:
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except (ValueError, TypeError):
+            pass
+        return []
+
     def record_scan_stats(self, stats: Dict[str, Any], scan_date: Optional[str] = None):
         date_key = self._today_key(scan_date)
         now = datetime.datetime.now().isoformat(timespec="seconds")
+        incoming_details = self._parse_error_details(stats.get("error_details"))
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT error_details FROM daily_scan_stats WHERE scan_date = ?", (date_key,))
+            existing_row = cursor.fetchone()
+            merged_details = self._parse_error_details(existing_row["error_details"]) if existing_row else []
+            for item in incoming_details:
+                if item not in merged_details:
+                    merged_details.append(item)
+            merged_details = merged_details[:10]
+            details_json = json.dumps(merged_details) if merged_details else None
+
             cursor.execute("""
                 INSERT INTO daily_scan_stats (
                     scan_date, scans_count, immich_direct_synced, amazon_uploaded,
                     icloud_uploaded, icloud_ingested, immich_uploaded,
-                    deletions_synced, albums_synced, errors, last_scan_at
+                    deletions_synced, albums_synced, errors, error_details, last_scan_at
                 )
-                VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(scan_date) DO UPDATE SET
                     scans_count = daily_scan_stats.scans_count + 1,
                     immich_direct_synced = daily_scan_stats.immich_direct_synced + excluded.immich_direct_synced,
@@ -242,6 +281,7 @@ class SyncDatabase:
                     deletions_synced = daily_scan_stats.deletions_synced + excluded.deletions_synced,
                     albums_synced = daily_scan_stats.albums_synced + excluded.albums_synced,
                     errors = daily_scan_stats.errors + excluded.errors,
+                    error_details = COALESCE(excluded.error_details, daily_scan_stats.error_details),
                     last_scan_at = excluded.last_scan_at
             """, (
                 date_key,
@@ -253,6 +293,7 @@ class SyncDatabase:
                 int(stats.get("deletions_synced", 0) or 0),
                 int(stats.get("albums_synced", 0) or 0),
                 int(stats.get("errors", 0) or 0),
+                details_json,
                 now,
             ))
             conn.commit()
@@ -264,7 +305,9 @@ class SyncDatabase:
             cursor.execute("SELECT * FROM daily_scan_stats WHERE scan_date = ?", (date_key,))
             row = cursor.fetchone()
             if row:
-                return dict(row)
+                result = dict(row)
+                result["error_details"] = self._parse_error_details(result.get("error_details"))
+                return result
         return {
             "scan_date": date_key,
             "scans_count": 0,
@@ -276,6 +319,7 @@ class SyncDatabase:
             "deletions_synced": 0,
             "albums_synced": 0,
             "errors": 0,
+            "error_details": [],
             "last_scan_at": None,
             "notified_at": None,
         }
@@ -295,3 +339,49 @@ class SyncDatabase:
                 ON CONFLICT(scan_date) DO UPDATE SET notified_at = excluded.notified_at
             """, (date_key, now))
             conn.commit()
+
+    def get_app_state(self, key: str) -> Optional[str]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM app_state WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row["value"] if row else None
+
+    def set_app_state(self, key: str, value: Optional[str]):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if value is None:
+                cursor.execute("DELETE FROM app_state WHERE key = ?", (key,))
+            else:
+                cursor.execute("""
+                    INSERT INTO app_state (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value,
+                        updated_at = excluded.updated_at
+                """, (key, value, now))
+            conn.commit()
+
+    def set_amazon_auth_paused(self, reason: str, cookie_fp: str):
+        payload = json.dumps({
+            "reason": reason,
+            "cookie_fp": cookie_fp,
+            "paused_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        })
+        self.set_app_state("amazon_auth_pause", payload)
+
+    def clear_amazon_auth_paused(self):
+        self.set_app_state("amazon_auth_pause", None)
+
+    def get_amazon_auth_pause(self) -> Optional[Dict[str, str]]:
+        raw = self.get_app_state("amazon_auth_pause")
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and data.get("reason"):
+                return data
+        except (ValueError, TypeError):
+            pass
+        return None
