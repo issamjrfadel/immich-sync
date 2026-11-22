@@ -706,7 +706,10 @@ class TestUIDashboard(unittest.TestCase):
         ]
         with patch("src.ui.app.sync_test_service", side_effect=side_effects), \
              patch("src.clients.amazon_login.try_refresh_amazon_cookies_from_profile", return_value=(True, {"session-id": "fresh-test-sess", "at-main": "fresh-at"}, "Auto-refreshed")):
-            resp = self.client.post("/api/test-connection/amazon")
+            resp = self.client.post(
+                "/api/test-connection/amazon",
+                json={"tld": "com", "cookies": {"session-id": "123-session", "at-main": "********"}},
+            )
 
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.json()["success"])

@@ -149,7 +149,7 @@ class RegionalAmazonPhotos(AmazonPhotos):
         if r is None or r.status_code != 200:
             status_code = getattr(r, 'status_code', 'unknown')
             if status_code == 401:
-                raise PermissionError("Amazon Photos session cookies have expired. Please copy fresh cookies from https://www.amazon.ca/photos into Settings.")
+                raise PermissionError(f"Amazon Photos session cookies have expired (HTTP 401) for amazon.{self.tld}.")
             raise ConnectionError(f"Failed to connect to Amazon Photos (HTTP {status_code})")
         data = r.json().get('data', [])
         if not data:
@@ -242,7 +242,7 @@ class AmazonPhotosClient:
         Returns the Amazon node ID on success or if already existing.
         """
         if self.session_expired:
-            raise PermissionError("Amazon Photos session cookies have expired. Please copy fresh cookies from https://www.amazon.ca/photos into Settings.")
+            raise PermissionError(f"Amazon Photos session cookies have expired (HTTP 401) for amazon.{self.tld}.")
 
         ap = self._ensure_client()
         file_path = Path(file_path)
@@ -293,7 +293,7 @@ class AmazonPhotosClient:
                 if resp.status_code == 401:
                     self.session_expired = True
                     raise PermissionError(
-                        "Amazon Photos session cookies have expired. Please copy fresh cookies from https://www.amazon.ca/photos into Settings."
+                        f"Amazon Photos session cookies have expired (HTTP 401) for amazon.{self.tld}."
                     )
 
                 resp.raise_for_status()

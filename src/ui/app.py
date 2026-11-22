@@ -948,10 +948,25 @@ def create_app(
         if req.enable_amazon is not False:
             active_pause = _get_active_amazon_pause(cfg)
             if active_pause:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Sync paused — manual intervention required: {active_pause['reason']}",
+                from src.clients.amazon_login import try_refresh_amazon_cookies_from_profile
+                ok, refreshed_cookies, refresh_msg = await asyncio.to_thread(
+                    try_refresh_amazon_cookies_from_profile, cfg.amazon.tld
                 )
+                if ok and refreshed_cookies:
+                    _persist_amazon_cookies(
+                        refreshed_cookies,
+                        cfg.amazon.tld,
+                        details=refresh_msg,
+                        connected=True,
+                        source="Sync Run Auto-Refresh",
+                        trigger_reprocess=False,
+                    )
+                    cfg = get_cfg() or cfg
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Sync paused — manual intervention required ({refresh_msg})",
+                    )
 
         sync_cfg = cfg.model_copy(deep=True)
         if req.dry_run:
@@ -1117,6 +1132,7 @@ def create_app(
 
             try:
                 first_iteration = True
+                attempted_pause_auto_refresh = False
                 while not sync_state["stop_daemon_event"].is_set():
                     active_cfg = get_cfg() or cfg
                     interval = active_cfg.sync.poll_interval_seconds
@@ -1140,8 +1156,34 @@ def create_app(
                             sync_state["amazon_auth_paused"] = False
                             sync_state["auth_paused_reason"] = None
                             logged_auth_pause = False
+                            attempted_pause_auto_refresh = False
                             resumed_from_token_update = True
                             logger.info("Detected updated Amazon Photos cookies; immediately reprocessing pending items.")
+                        elif not attempted_pause_auto_refresh:
+                            attempted_pause_auto_refresh = True
+                            from src.clients.amazon_login import try_refresh_amazon_cookies_from_profile
+                            ok, refreshed_cookies, refresh_msg = try_refresh_amazon_cookies_from_profile(active_cfg.amazon.tld)
+                            if ok and refreshed_cookies:
+                                _persist_amazon_cookies(
+                                    refreshed_cookies,
+                                    active_cfg.amazon.tld,
+                                    details=refresh_msg,
+                                    connected=True,
+                                    source="Auto Browser Refresh",
+                                    trigger_reprocess=False,
+                                )
+                                active_cfg = get_cfg() or active_cfg
+                                logged_auth_pause = False
+                                resumed_from_token_update = True
+                                logger.info("Recovered expired Amazon Photos session automatically on daemon startup; reprocessing pending items.")
+                            else:
+                                auth_paused = True
+                                sync_state["amazon_auth_paused"] = True
+                                sync_state["auth_paused_reason"] = refresh_msg or raw_pause["reason"]
+                                service_status_cache["amazon"]["connected"] = False
+                                service_status_cache["amazon"]["details"] = sync_state["auth_paused_reason"]
+                                logger.warning(f"Sync daemon paused until Amazon token is updated: {sync_state['auth_paused_reason']}")
+                                logged_auth_pause = True
                         else:
                             auth_paused = True
                             sync_state["amazon_auth_paused"] = True
@@ -1153,6 +1195,7 @@ def create_app(
                                 logged_auth_pause = True
                     else:
                         logged_auth_pause = False
+                        attempted_pause_auto_refresh = False
 
                     _ensure_watcher(active_cfg, is_auth_paused=auth_paused)
 
@@ -1179,6 +1222,7 @@ def create_app(
                             if stats.get("amazon_session_expired"):
                                 auth_paused = True
                                 logged_auth_pause = True
+                                attempted_pause_auto_refresh = True
                                 _ensure_watcher(active_cfg, is_auth_paused=True)
                         except Exception as e:
                             logger.error(f"Daemon cycle error: {e}")
@@ -1337,25 +1381,31 @@ def create_app(
         result = await asyncio.to_thread(sync_test_service, service, payload, cfg)
         if (
             service == "amazon"
-            and cfg is not None
             and not result.get("success")
-            and not (payload and payload.get("cookies"))
             and is_amazon_auth_error(Exception(result.get("message", "")))
         ):
+            tld = (
+                (payload.get("tld") if isinstance(payload, dict) else None)
+                or (cfg.amazon.tld if cfg else "ca")
+            )
             from src.clients.amazon_login import try_refresh_amazon_cookies_from_profile
             ok, refreshed_cookies, refresh_msg = await asyncio.to_thread(
-                try_refresh_amazon_cookies_from_profile, cfg.amazon.tld
+                try_refresh_amazon_cookies_from_profile, tld
             )
             if ok and refreshed_cookies:
                 _persist_amazon_cookies(
                     refreshed_cookies,
-                    cfg.amazon.tld,
+                    tld,
                     details=refresh_msg,
                     connected=True,
                     source="Test Auto-Refresh",
                 )
                 refreshed_cfg = get_cfg()
                 result = await asyncio.to_thread(sync_test_service, service, None, refreshed_cfg)
+            elif refresh_msg:
+                msg = f"Amazon Photos session expired. {refresh_msg}"
+                result["message"] = msg
+                service_status_cache["amazon"]["details"] = msg
         return result
 
     @app.post("/api/notifications/test")
