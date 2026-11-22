@@ -1071,9 +1071,11 @@ class TestSyncComponents(unittest.TestCase):
 
         fake_ctx = MagicMock()
         fake_ctx.pages = [fake_page]
+        # Stale .amazon.com cookie appears AFTER .amazon.ca cookie; exact .amazon.ca must still win
         fake_ctx.cookies.return_value = [
             {"domain": ".amazon.ca", "name": "session-id", "value": "refreshed-sess"},
             {"domain": ".amazon.ca", "name": "at-acbca", "value": "refreshed-at"},
+            {"domain": ".amazon.com", "name": "session-id", "value": "stale-com-sess"},
         ]
 
         captured_headless = []

@@ -194,7 +194,7 @@ class AmazonPhotosClient:
 
         return c
 
-    def _ensure_client(self) -> RegionalAmazonPhotos:
+    def _ensure_client(self, quiet: bool = False) -> RegionalAmazonPhotos:
         if self._ap is not None:
             return self._ap
 
@@ -215,12 +215,17 @@ class AmazonPhotosClient:
         except Exception as e:
             if is_amazon_auth_error(e):
                 self.session_expired = True
-            logger.error(f"Failed to initialize Amazon Photos client for amazon.{self.tld}: {e}")
+                if quiet:
+                    logger.debug(f"Amazon Photos auth check not yet valid for amazon.{self.tld}: {e}")
+                else:
+                    logger.warning(f"Amazon Photos session expired for amazon.{self.tld}: {e}")
+            else:
+                logger.error(f"Failed to initialize Amazon Photos client for amazon.{self.tld}: {e}")
             raise
 
-    def test_connection(self) -> Dict[str, Any]:
+    def test_connection(self, quiet: bool = False) -> Dict[str, Any]:
         """Test connection to Amazon Photos and return root folder metadata."""
-        ap = self._ensure_client()
+        ap = self._ensure_client(quiet=quiet)
         root = ap.get_root()
         return {
             "connected": True,

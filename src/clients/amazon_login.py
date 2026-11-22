@@ -25,14 +25,38 @@ _AUTH_CHALLENGE_MARKERS = (
 
 
 def _extract_amazon_cookies(all_cookies: list, tld: str) -> Dict[str, str]:
-    """Filter Playwright cookie list to Amazon domain entries."""
-    return {
-        c["name"]: c["value"]
-        for c in (all_cookies or [])
-        if (f"amazon.{tld}" in c.get("domain", "") or "amazon" in c.get("domain", ""))
-        and c.get("name")
-        and c.get("value")
-    }
+    """Filter Playwright cookie list, preferring exact amazon.<tld> domain over other Amazon TLDs."""
+    clean_tld = (tld or "ca").lower().strip()
+    exact_suffix = f"amazon.{clean_tld}"
+    other_cookies: Dict[str, str] = {}
+    exact_cookies: Dict[str, str] = {}
+    for c in (all_cookies or []):
+        domain = (c.get("domain") or "").lower()
+        name = c.get("name")
+        value = c.get("value")
+        if not name or not value:
+            continue
+        if exact_suffix in domain:
+            exact_cookies[name] = value
+        elif "amazon" in domain:
+            other_cookies[name] = value
+    # Exact marketplace cookies win so stale .amazon.com cookies cannot overwrite .amazon.ca
+    return {**other_cookies, **exact_cookies}
+
+
+def _get_target_cookies(context, target_url: str, tld: str) -> Dict[str, str]:
+    try:
+        raw = context.cookies([target_url])
+    except TypeError:
+        raw = context.cookies()
+    except Exception:
+        raw = context.cookies()
+    if not raw:
+        try:
+            raw = context.cookies()
+        except Exception:
+            raw = []
+    return _extract_amazon_cookies(raw, tld)
 
 
 def _has_required_amazon_tokens(cookie_dict: Dict[str, str], tld: str) -> bool:
@@ -95,7 +119,7 @@ def _launch_amazon_context(playwright, user_data_dir: str, headless: bool):
 def try_refresh_amazon_cookies_from_profile(
     tld: str = "ca",
     user_data_dir: Optional[str] = None,
-    timeout_seconds: int = 20,
+    timeout_seconds: int = 35,
 ) -> Tuple[bool, Dict[str, str], str]:
     """
     Attempt a non-interactive refresh of Amazon Photos cookies using an existing
@@ -125,18 +149,22 @@ def try_refresh_amazon_cookies_from_profile(
     )
 
     try:
+        from src.clients.amazon import AmazonPhotosClient, amazon_cookie_fingerprint
+        from src.config import AmazonConfig
+
         with sync_playwright() as p:
             context = _launch_amazon_context(p, str(profile_dir), headless=use_headless)
             try:
                 page = context.pages[0] if context.pages else context.new_page()
                 try:
-                    page.goto(target_url, wait_until="domcontentloaded", timeout=min(timeout_seconds, 20) * 1000)
+                    page.goto(target_url, wait_until="load", timeout=min(timeout_seconds, 25) * 1000)
                 except Exception as nav_err:
                     logger.debug(f"Amazon cookie refresh navigation notice: {nav_err}")
 
-                deadline = time.time() + max(8, timeout_seconds)
+                deadline = time.time() + max(10, timeout_seconds)
                 auth_first_seen: Optional[float] = None
-                auth_grace_seconds = 8.0
+                auth_grace_seconds = 12.0
+                tested_fps = set()
 
                 while time.time() < deadline:
                     cur_url = ""
@@ -153,18 +181,18 @@ def try_refresh_amazon_cookies_from_profile(
                             return False, {}, "Amazon session requires interactive sign-in or verification; manual intervention is required."
                     else:
                         auth_first_seen = None
-                        cookie_dict = _extract_amazon_cookies(context.cookies(), clean_tld)
+                        cookie_dict = _get_target_cookies(context, target_url, clean_tld)
                         if _has_required_amazon_tokens(cookie_dict, clean_tld):
-                            from src.clients.amazon import AmazonPhotosClient
-                            from src.config import AmazonConfig
-
-                            try:
-                                client = AmazonPhotosClient(AmazonConfig(cookies=cookie_dict, tld=clean_tld))
-                                client.test_connection()
-                                logger.info(f"Successfully refreshed Amazon Photos cookies automatically for amazon.{clean_tld}.")
-                                return True, cookie_dict, f"Automatically refreshed Amazon Photos session (amazon.{clean_tld})."
-                            except Exception as verify_err:
-                                logger.debug(f"Auto-refresh cookie verification retry: {verify_err}")
+                            fp = amazon_cookie_fingerprint(cookie_dict, clean_tld)
+                            if fp not in tested_fps:
+                                tested_fps.add(fp)
+                                try:
+                                    client = AmazonPhotosClient(AmazonConfig(cookies=cookie_dict, tld=clean_tld))
+                                    client.test_connection(quiet=True)
+                                    logger.info(f"Successfully refreshed Amazon Photos cookies automatically for amazon.{clean_tld}.")
+                                    return True, cookie_dict, f"Automatically refreshed Amazon Photos session (amazon.{clean_tld})."
+                                except Exception as verify_err:
+                                    logger.debug(f"Auto-refresh cookie verification retry: {verify_err}")
 
                     time.sleep(1.5)
 
@@ -319,7 +347,7 @@ class AmazonBrowserLogin:
 
                     # Check current page URL & cookies
                     try:
-                        cookie_dict = _extract_amazon_cookies(context.cookies(), self.tld)
+                        cookie_dict = _get_target_cookies(context, target_url, self.tld)
 
                         cur_url = ""
                         try:
@@ -339,7 +367,7 @@ class AmazonBrowserLogin:
                             test_cfg = AmazonConfig(cookies=cookie_dict, tld=self.tld)
                             client = AmazonPhotosClient(test_cfg)
                             try:
-                                info = client.test_connection()
+                                info = client.test_connection(quiet=True)
                                 with self._lock:
                                     self.status["state"] = "success"
                                     self.status["message"] = f"Connected to Amazon Photos (amazon.{self.tld})!"

@@ -28,7 +28,7 @@ from src.schedule import parse_schedule_times, next_scheduled_run
 from src.notifications import maybe_send_daily_summary, maybe_send_error_alert, send_test_notification
 from src.clients.immich import ImmichClient
 from src.clients.icloud import ICloudClient
-from src.clients.amazon import AmazonPhotosClient, amazon_cookie_fingerprint
+from src.clients.amazon import AmazonPhotosClient, amazon_cookie_fingerprint, is_amazon_auth_error
 
 logger = logging.getLogger("immich_sync")
 
@@ -1335,6 +1335,27 @@ def create_app(
     async def test_service_connection(service: str, payload: Optional[dict] = None):
         cfg = get_cfg()
         result = await asyncio.to_thread(sync_test_service, service, payload, cfg)
+        if (
+            service == "amazon"
+            and cfg is not None
+            and not result.get("success")
+            and not (payload and payload.get("cookies"))
+            and is_amazon_auth_error(Exception(result.get("message", "")))
+        ):
+            from src.clients.amazon_login import try_refresh_amazon_cookies_from_profile
+            ok, refreshed_cookies, refresh_msg = await asyncio.to_thread(
+                try_refresh_amazon_cookies_from_profile, cfg.amazon.tld
+            )
+            if ok and refreshed_cookies:
+                _persist_amazon_cookies(
+                    refreshed_cookies,
+                    cfg.amazon.tld,
+                    details=refresh_msg,
+                    connected=True,
+                    source="Test Auto-Refresh",
+                )
+                refreshed_cfg = get_cfg()
+                result = await asyncio.to_thread(sync_test_service, service, None, refreshed_cfg)
         return result
 
     @app.post("/api/notifications/test")

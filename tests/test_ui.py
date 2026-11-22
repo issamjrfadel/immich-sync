@@ -697,6 +697,22 @@ class TestUIDashboard(unittest.TestCase):
         self.assertIn('name="cfg_sync_mode" value="polling"', html)
         self.assertIn('name="cfg_sync_mode" value="scheduled"', html)
 
+    def test_test_connection_amazon_auto_refreshes_expired_cookies(self):
+        from unittest.mock import patch
+
+        side_effects = [
+            {"success": False, "message": "Amazon Photos session cookies have expired."},
+            {"success": True, "message": "Connected to Amazon Photos (amazon.com)", "tld": "com"},
+        ]
+        with patch("src.ui.app.sync_test_service", side_effect=side_effects), \
+             patch("src.clients.amazon_login.try_refresh_amazon_cookies_from_profile", return_value=(True, {"session-id": "fresh-test-sess", "at-main": "fresh-at"}, "Auto-refreshed")):
+            resp = self.client.post("/api/test-connection/amazon")
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
+        saved = json.loads(self.cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["amazon"]["cookies"]["session-id"], "fresh-test-sess")
+
 
 if __name__ == "__main__":
     unittest.main()
